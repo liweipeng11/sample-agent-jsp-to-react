@@ -10,15 +10,10 @@ import { availableTools, tools } from "./tools/tools.js";
 
 dotenv.config();
 
-// 初始化 Express 应用
-const app = express();
-const port = process.env.PORT || 3080;
+// 创建路由实例而不是应用实例
+const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// 中间件
-app.use(cors());
-app.use(bodyParser.json());
 
 // 初始化 OpenAI 客户端
 const openai = new OpenAI({
@@ -230,7 +225,7 @@ async function handleToolCalls(toolCalls, sessionId) {
 
 
 // --- API 路由 ---
-app.post('/api/chat', async (req, res) => {
+router.post('/chat', async (req, res) => {
     try {
         const { message, sessionId = 'default' } = req.body;
         console.log("收到请求 sessionId:", sessionId);
@@ -318,7 +313,7 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // 会话管理
-app.get('/api/sessions/:sessionId', (req, res) => {
+router.get('/sessions/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     if (!sessions[sessionId]) {
         return res.status(404).json({ error: '会话不存在' });
@@ -326,7 +321,7 @@ app.get('/api/sessions/:sessionId', (req, res) => {
     return res.json({ history: sessions[sessionId] });
 });
 
-app.delete('/api/sessions/:sessionId', (req, res) => {
+router.delete('/sessions/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     if (sessions[sessionId]) {
         delete sessions[sessionId];
@@ -334,17 +329,5 @@ app.delete('/api/sessions/:sessionId', (req, res) => {
     return res.json({ success: true });
 });
 
-// 启动服务器
-async function startServer() {
-    app.listen(port, () => {
-        console.log(`API 服务器已启动，监听端口 ${port}`);
-        console.log(`POST http://localhost:${port}/api/chat`);
-    });
-}
-
-process.on('SIGINT', () => {
-    console.log('正在关闭服务器...');
-    process.exit(0);
-});
-
-startServer();
+// 导出路由而不是启动服务器
+export default router;

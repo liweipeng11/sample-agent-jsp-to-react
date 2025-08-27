@@ -8,12 +8,10 @@ import { tools, filterAndGenerateReactComponent } from "./tools/tools.js";
 
 dotenv.config();
 
-const app = express();
-const port = process.env.PORT || 3081;
+// 创建路由实例而不是应用实例
+const router = express.Router();
 
-app.use(cors());
-app.use(bodyParser.json());
-
+// 初始化 OpenAI 客户端
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
     baseURL: process.env.OPENAI_API_BASE,
@@ -38,7 +36,7 @@ const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于�
 10. 不添加任何额外功能或解释性注释
 请提供需要转换的JSON数据，我将严格按照上述规则生成对应的React JSX组件代码。`;
 
-// --- [新增] JSON 修复工具 (完全来自 index.js) ---
+// --- JSON 修复工具 ---
 async function fixJsonWithLlm(brokenJsonString) {
     console.log("启动 LLM 进行 JSON 修复...");
     try {
@@ -66,7 +64,7 @@ async function fixJsonWithLlm(brokenJsonString) {
     }
 }
 
-// --- [核心修改] 工具调用规范化 (与 index.js 完全一致的实现) ---
+// --- 工具调用规范化 ---
 async function normalizeToolCallsWithLlm(rawContent) {
     if (!rawContent || !rawContent.includes('<tool_call>')) {
         return [];
@@ -147,7 +145,7 @@ async function normalizeToolCallsWithLlm(rawContent) {
     return allResults;
 }
 
-// --- [重构] 统一的工具处理函数 (结合了 index.js 的错误处理和JSON修复) ---
+// --- 统一的工具处理函数 ---
 async function handleToolCalls(toolCalls, sessionId) {
     if (!toolCalls || toolCalls.length === 0) return [];
     if (!sessions[sessionId]) sessions[sessionId] = [];
@@ -211,9 +209,8 @@ async function handleToolCalls(toolCalls, sessionId) {
     console.log("所有工具调用完成 ✅");
 }
 
-
-// --- [重构] API 路由，集成新的工具调用处理逻辑 ---
-app.post('/api/generate-react', async (req, res) => {
+// --- API 路由 ---
+router.post('/generate-react', async (req, res) => {
     try {
         const { message, sessionId = `session_${Date.now()}` } = req.body;
         if (!message) {
@@ -226,7 +223,7 @@ app.post('/api/generate-react', async (req, res) => {
         sessions[sessionId].push({ role: "user", content: `请根据以下JSON生成React组件: ${message}` });
 
         // 检查输入是否包含需要清理的标签
-        const needsFiltering = /"tagName"\s*:\s*"(html|head|body|title)"/i.test(message);
+        const needsFiltering = /\"tagName\"\\s*:\\s*\"(html|head|body|title)\"/i.test(message);
         console.log(`是否需要调用过滤工具? ${needsFiltering}`);
 
         // 准备 API 请求参数
@@ -240,11 +237,12 @@ app.post('/api/generate-react', async (req, res) => {
             apiRequestOptions.tools = tools;
             apiRequestOptions.tool_choice = "auto";
         }
+        
         // 第一步：让 LLM 规划（根据条件可能包含工具）
         const plannerResponse = await openai.chat.completions.create(apiRequestOptions);
         const responseMessage = plannerResponse.choices[0].message;
 
-        // --- 核心修改点：获取并规范化 tool_calls ---
+        // 获取并规范化 tool_calls
         let toolCallsToProcess = responseMessage.tool_calls || [];
 
         // 如果标准 tool_calls 为空，但 content 中有内容，则尝试从 content 中解析
@@ -258,7 +256,6 @@ app.post('/api/generate-react', async (req, res) => {
                 console.log("已成功从 content 中规范化工具调用。");
             }
         }
-        // --- 核心修改结束 ---
 
         sessions[sessionId].push(responseMessage);
 
@@ -274,7 +271,7 @@ app.post('/api/generate-react', async (req, res) => {
             });
 
             let reactCode = finalResponse.choices[0].message.content || "";
-            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
+            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\\n/i, '').replace(/\\n```$/, '');
 
             sessions[sessionId].push(finalResponse.choices[0].message);
             console.log("整合结果完成 ✅")
@@ -283,7 +280,7 @@ app.post('/api/generate-react', async (req, res) => {
         } else {
             console.log("助手未调用工具，直接返回内容。");
             let reactCode = responseMessage.content || "";
-            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
+            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\\n/i, '').replace(/\\n```$/, '');
             res.json({
                 success: true,
                 reactCode,
@@ -297,6 +294,5 @@ app.post('/api/generate-react', async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`JSON 转 React 服务已启动，监听端口 ${port}`);
-});
+// 导出路由而不是启动服务器
+export default router;
