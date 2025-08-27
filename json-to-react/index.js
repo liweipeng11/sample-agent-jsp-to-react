@@ -1,25 +1,16 @@
 import express from 'express';
-import cors from 'cors';
-import bodyParser from 'body-parser';
-import OpenAI from "openai";
 import JSON5 from 'json5';
-import dotenv from 'dotenv';
 import { tools, filterAndGenerateReactComponent } from "./tools/tools.js";
-
-dotenv.config();
+import { 
+    openai, 
+    sessions, 
+    fixJsonWithLlm, 
+    normalizeToolCallsWithLlm,
+    initializeSession 
+} from "../utils/common.js";
 
 // 创建路由实例而不是应用实例
 const router = express.Router();
-
-// 初始化 OpenAI 客户端
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    baseURL: process.env.OPENAI_API_BASE,
-    timeout: 1000000
-});
-
-// 存储用户会话
-const sessions = {};
 
 // 系统提示
 const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于将结构化的JSON中间表示（IR）精确地转换为高效、可维护的React JSX代码。
@@ -36,117 +27,8 @@ const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于�
 10. 不添加任何额外功能或解释性注释
 请提供需要转换的JSON数据，我将严格按照上述规则生成对应的React JSX组件代码。`;
 
-// --- JSON 修复工具 ---
-async function fixJsonWithLlm(brokenJsonString) {
-    console.log("启动 LLM 进行 JSON 修复...");
-    try {
-        const response = await openai.chat.completions.create({
-            model: process.env.OPENAI_MODEL || 'qwen3-coder',
-            temperature: 0,
-            messages: [
-                {
-                    role: "system",
-                    content: `你是一个专门修复 JSON 字符串的 AI 工具。
-- 你的输出必须且只能是一个 JSON 对象或数组字符串。
-- 不要添加解释、注释、代码块标记。
-- 确保所有字符串内部的双引号都正确转义。`
-                },
-                { role: "user", content: brokenJsonString }
-            ]
-        });
-        const fixedJson = response.choices[0].message.content;
-        if (!fixedJson) throw new Error("LLM 修复返回空内容。");
-        console.log("LLM 修复后的结果:", fixedJson);
-        return fixedJson;
-    } catch (error) {
-        console.error("调用 LLM 修复 JSON 出错:", error);
-        throw new Error("LLM-based JSON repair failed.");
-    }
-}
-
-// --- 工具调用规范化 ---
-async function normalizeToolCallsWithLlm(rawContent) {
-    if (!rawContent || !rawContent.includes('<tool_call>')) {
-        return [];
-    }
-
-    console.log("检测到非标准工具调用格式，逐条分割处理...");
-    const toolCallBlocks = rawContent.split(/<\/tool_call>/i).filter(Boolean).map(b => b + "</tool_call>");
-    const allResults = [];
-
-    for (let i = 0; i < toolCallBlocks.length; i++) {
-        const block = toolCallBlocks[i];
-        console.log(`处理第 ${i + 1} 个 tool_call 片段...`);
-        console.log(`片段内容: ${block}`);
-
-        try {
-            // --- 尝试正则解析 ---
-            const nameMatch = block.match(/<function\s*=\s*["']?([^>\s"']+)["']?\s*>/i);
-            const paramMatch = block.match(/<parameter\s*=\s*["']?([^>\s"']+)["']?\s*>([\s\S]*?)<\/parameter>/i);
-
-            if (nameMatch) {
-                const toolName = nameMatch[1].trim();
-                // 假设参数只有一个并且是unfilteredJson，这部分可以根据你的工具定制
-                const paramValue = paramMatch ? paramMatch[2].trim() : "";
-
-                const parsed = [{
-                    id: "call_" + Date.now() + "_" + i,
-                    type: "function",
-                    function: {
-                        name: toolName,
-                        // 这里我们假设参数的key固定为unfilteredJson，以匹配你的工具
-                        arguments: JSON.stringify({ unfilteredJson: paramValue })
-                    }
-                }];
-
-                console.log("正则解析成功 ✅", parsed);
-                allResults.push(...parsed);
-                continue; // 本条解析成功，不走 LLM
-            }
-
-            // --- 如果正则解析失败，才走 LLM ---
-            console.warn("正则解析失败，尝试使用 LLM 规范化...");
-            const response = await openai.chat.completions.create({
-                model: process.env.OPENAI_MODEL || 'qwen3-coder',
-                temperature: 0,
-                messages: [
-                    {
-                        role: "system",
-                        content: `你是一个 AI 助手，专门将单个 <tool_call> 片段转换为严格的 OpenAI tool_calls JSON 格式。
-- 输入：一个 <tool_call>...</tool_call> 片段
-- 输出：一个 JSON 数组，里面只有一个对象
-- arguments 必须是 JSON 字符串
-- 输出必须是严格 JSON，不要解释或 markdown 包裹`
-                    },
-                    { role: "user", content: block }
-                ]
-            });
-
-            const jsonOutput = response.choices[0].message.content;
-            console.log("LLM 规范化后的单条输出:", jsonOutput);
-
-            let parsed;
-            try {
-                parsed = JSON.parse(jsonOutput);
-            } catch (e1) {
-                console.warn(`解析失败，尝试 LLM 修复: ${e1.message}`);
-                const fixed = await fixJsonWithLlm(jsonOutput);
-                parsed = JSON.parse(fixed);
-            }
-
-            if (Array.isArray(parsed)) {
-                allResults.push(...parsed);
-            }
-        } catch (err) {
-            console.error(`处理第 ${i + 1} 个 tool_call 出错:`, err);
-        }
-    }
-
-    return allResults;
-}
-
-// --- 统一的工具处理函数 ---
-async function handleToolCalls(toolCalls, sessionId) {
+// --- React专用的工具处理函数 ---
+async function handleReactToolCalls(toolCalls, sessionId) {
     if (!toolCalls || toolCalls.length === 0) return [];
     if (!sessions[sessionId]) sessions[sessionId] = [];
 
@@ -209,6 +91,8 @@ async function handleToolCalls(toolCalls, sessionId) {
     console.log("所有工具调用完成 ✅");
 }
 
+
+
 // --- API 路由 ---
 router.post('/generate-react', async (req, res) => {
     try {
@@ -217,13 +101,11 @@ router.post('/generate-react', async (req, res) => {
             return res.status(400).json({ error: 'message 不能为空' });
         }
 
-        if (!sessions[sessionId]) {
-            sessions[sessionId] = [{ role: "system", content: systemPrompt }];
-        }
+        initializeSession(sessionId, systemPrompt);
         sessions[sessionId].push({ role: "user", content: `请根据以下JSON生成React组件: ${message}` });
 
         // 检查输入是否包含需要清理的标签
-        const needsFiltering = /\"tagName\"\\s*:\\s*\"(html|head|body|title)\"/i.test(message);
+        const needsFiltering = /"tagName"\s*:\s*"(html|head|body|title|script|meta|noscript|link)"/i.test(message);
         console.log(`是否需要调用过滤工具? ${needsFiltering}`);
 
         // 准备 API 请求参数
@@ -261,7 +143,7 @@ router.post('/generate-react', async (req, res) => {
 
         if (toolCallsToProcess && toolCallsToProcess.length > 0) {
             console.log("助手决定使用工具，开始执行...");
-            await handleToolCalls(toolCallsToProcess, sessionId);
+            await handleReactToolCalls(toolCallsToProcess, sessionId);
 
             console.log("工具执行完毕，启动 LLM 整合结果...");
             const finalResponse = await openai.chat.completions.create({
