@@ -1,4 +1,6 @@
-// 1. 定义工具
+import { openai } from "../../utils/common.js";
+
+// 1. 定义工具 (工具的接口定义保持不变)
 // 这个定义告诉模型：有一个名为 'filterAndGenerateReactComponent' 的工具，
 // 它接收一个名为 'unfilteredJson' 的参数，这个参数是一个完整的 JSON 对象。
 export const tools = [
@@ -22,34 +24,43 @@ export const tools = [
 ];
 
 /**
- * 实际执行过滤的函数。
- * 当模型请求调用工具时，您的服务器将运行此代码。
- * @param {object} inputJson 未经处理的原始JSON。
- * @returns {object} 只包含核心UI元素的、经过清理的JSON。
+ * 实际执行过滤的函数 (新实现)。
+ * 此函数现在调用大模型来清理JSON，而不是手动递归。
+ * @param {object} inputJson 未经处理的原始JSON对象。
+ * @returns {Promise<object>} 只包含核心UI元素的、经过清理的JSON对象。
  */
-export function filterAndGenerateReactComponent(inputJson) {
-  const tagsToRemove = ['meta', 'title', 'link', 'script', 'noscript'];
-  const tagsToFlatten = ['html', 'head', 'body'];
+export async function filterAndGenerateReactComponent(inputJson) {
+  console.log("正在使用大模型清理JSON...");
 
-  function recursiveFilter(nodes) {
-    if (!Array.isArray(nodes)) {
-      return [];
-    }
-    return nodes.flatMap(node => {
-      if (tagsToRemove.includes(node.tagName)) {
-        return [];
-      }
-      if (tagsToFlatten.includes(node.tagName)) {
-        return recursiveFilter(node.children);
-      }
-      return [{
-        ...node,
-        children: recursiveFilter(node.children)
-      }];
+  const systemPrompt = `你是一个JSON转换机器人。你的任务是过滤一个代表DOM树的JSON对象。
+  严格遵守以下规则：
+  1. 移除 tagName 为 'meta', 'title', 'link', 'script', 'noscript' 的节点。
+  2. 对于 tagName 为 'html', 'head', 'body' 的节点，不要包含节点本身，而是直接处理并包含其 children 数组中的内容。
+  3. 递归处理所有子节点，确保深层嵌套的节点也符合规则。
+  4. 最终输出必须是一个有效的、经过清理的JSON对象，不包含任何解释、注释或Markdown代码块。
+  5. 输入的原始JSON结构为 { "elements": [...] }，你返回的清理后的JSON也必须保持 { "elements": [...] } 这种结构。`;
+
+  try {
+    const response = await openai.chat.completions.create({
+        model: process.env.OPENAI_MODEL || "gpt-4-turbo",
+        messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `请根据规则清理以下JSON:\n${JSON.stringify(inputJson, null, 2)}` }
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" }, // 请求JSON格式输出以提高可靠性
     });
-  }
 
-  const newJson = JSON.parse(inputJson);
-  newJson.elements = recursiveFilter(newJson.elements);
-  return newJson;
+    const cleanedJsonString = response.choices[0].message.content;
+    console.log("大模型返回的清理后JSON:", cleanedJsonString);
+    
+    // 解析大模型返回的JSON字符串
+    const cleanedJson = JSON.parse(cleanedJsonString);
+    return cleanedJson;
+
+  } catch (error) {
+    console.error("使用大模型清理JSON时出错:", error);
+    // 在出错时抛出异常，以便上层调用者可以捕获
+    throw new Error("大模型在清理JSON时失败。");
+  }
 }

@@ -1,5 +1,6 @@
 import express from 'express';
 import JSON5 from 'json5';
+import { parse } from '@babel/parser'; // <<< 新增：引入Babel解析器
 import { tools, filterAndGenerateReactComponent } from "./tools/tools.js";
 import { 
     openai, 
@@ -12,7 +13,7 @@ import {
 // 创建路由实例而不是应用实例
 const router = express.Router();
 
-// 系统提示
+// 系统提示 (保持不变)
 const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于将结构化的JSON中间表示（IR）精确地转换为高效、可维护的React JSX代码。
 根据提供的JSON数据生成React组件(JSX格式)，严格遵循以下规则：
 1. 仅转换body内的子元素，忽略html/head/body/script/meta标签
@@ -24,10 +25,10 @@ const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于�
 7. 完全忽略title标签
 8. 正确解析<%...%>中的变量和条件表达式
 9. 最终输出必须是完整的JSX文件内容
-10. 不添加任何额外功能或解释性注释
+10. 最终输出必须是一个有效的、经过清理的jsx代码，不包含任何解释、注释或Markdown代码块。
 请提供需要转换的JSON数据，我将严格按照上述规则生成对应的React JSX组件代码。`;
 
-// --- React专用的工具处理函数 ---
+// --- React专用的工具处理函数 --- (保持不变)
 async function handleReactToolCalls(toolCalls, sessionId) {
     if (!toolCalls || toolCalls.length === 0) return [];
     if (!sessions[sessionId]) sessions[sessionId] = [];
@@ -39,7 +40,6 @@ async function handleReactToolCalls(toolCalls, sessionId) {
         const toolName = functionCall.name;
         const toolCallId = toolCall.id;
 
-        // 仅处理我们期望的工具
         if (toolName !== 'filterAndGenerateReactComponent') {
             const errorResult = { error: `工具 '${toolName}' 不存在。` };
             sessions[sessionId].push({
@@ -53,23 +53,19 @@ async function handleReactToolCalls(toolCalls, sessionId) {
             const rawArguments = functionCall.arguments;
             console.log(`模型 [${toolName}] 返回的原始参数:`, rawArguments);
 
-            // 第一级解析: 尝试使用 JSON5 (更宽松)
             try {
                 args = JSON5.parse(rawArguments);
                 console.log("第一级解析 (JSON5) 成功。");
             } catch (e1) {
-                // 第二级解析: 如果 JSON5 失败，调用 LLM 修复
                 console.warn("第一级解析失败，尝试 LLM 修复...");
                 const fixedJsonString = await fixJsonWithLlm(rawArguments);
-                args = JSON.parse(fixedJsonString); // 修复后应该能被标准 JSON 解析
+                args = JSON.parse(fixedJsonString);
                 console.log("第二级解析 (LLM 修复后) 成功。");
             }
 
-            // 执行工具函数
-            const result = filterAndGenerateReactComponent(args.unfilteredJson);
+            const result = await filterAndGenerateReactComponent(args.unfilteredJson);
             console.log(`${toolName} 工具执行结果:`, result);
 
-            // 将结果存入会话
             sessions[sessionId].push({
                 role: "tool",
                 tool_call_id: toolCallId,
@@ -86,14 +82,70 @@ async function handleReactToolCalls(toolCalls, sessionId) {
         }
     });
 
-    // 并发执行所有任务
     await Promise.all(tasks.map(task => task()));
     console.log("所有工具调用完成 ✅");
 }
 
+// --- 新增：代码验证与修复辅助函数 ---
+
+/**
+ * 使用 @babel/parser 验证生成的React代码是否存在语法错误。
+ * 如果代码无效，它将抛出一个错误。
+ * @param {string} code - 要验证的React代码字符串。
+ */
+async function validateJsxSyntax(code) {
+    try {
+        parse(code, {
+            sourceType: 'module',
+            plugins: ['jsx'], // 启用JSX插件
+        });
+    } catch (error) {
+        console.error("JSX语法验证失败:", error.message);
+        const syntaxError = new Error(`JSX语法无效: ${error.message}`);
+        syntaxError.code = code; // 将错误代码附加到error对象上，便于返回
+        throw syntaxError;
+    }
+}
+
+/**
+ * 使用大模型检查并修复React组件中未声明的变量。
+ * @param {string} code - 语法正确的React代码。
+ * @returns {Promise<string>} - 修复了变量声明的代码。
+ */
+async function fixUndeclaredVariables(code) {
+    const repairPrompt = `你是一位React专家。你的任务是修复一段React组件代码。
+请检查以下代码，识别所有被使用但未声明的变量。
+对于每一个未声明的变量，必须在组件顶部使用 'useState' hook 进行初始化。
+关键规则：初始化时，必须同时声明变量本身及其对应的setter函数。
+例如：如果发现变量 'userName' 未声明，你应该添加 'const [userName, setUserName] = useState(undefined);'。
+不要修改任何已有的代码逻辑，只在顶部添加必要的 'useState' 声明。
+最终只返回完整的、修复后的JSX代码，不包含任何解释或Markdown。`;
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: process.env.OPENAI_MODEL || "gpt-4-turbo",
+            messages: [
+                { role: "system", content: repairPrompt },
+                { role: "user", content: code }
+            ],
+            temperature: 0,
+        });
+        
+        let fixedCode = response.choices[0].message.content || "";
+        // 清理可能出现的Markdown代码块
+        fixedCode = fixedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
+        
+        console.log("变量修复模型返回的代码:", fixedCode);
+        return fixedCode;
+
+    } catch (error) {
+        console.error("使用大模型修复变量时出错:", error);
+        throw new Error("使用大模型修复变量时失败。");
+    }
+}
 
 
-// --- API 路由 ---
+// --- API 路由 (已更新验证逻辑) ---
 router.post('/generate-react', async (req, res) => {
     try {
         const { message, sessionId = `session_${Date.now()}` } = req.body;
@@ -104,36 +156,29 @@ router.post('/generate-react', async (req, res) => {
         initializeSession(sessionId, systemPrompt);
         sessions[sessionId].push({ role: "user", content: `请根据以下JSON生成React组件: ${message}` });
 
-        // 检查输入是否包含需要清理的标签
         const needsFiltering = /"tagName"\s*:\s*"(html|head|body|title|script|meta|noscript|link)"/i.test(message);
         console.log(`是否需要调用过滤工具? ${needsFiltering}`);
 
-        // 准备 API 请求参数
         const apiRequestOptions = {
             model: process.env.OPENAI_MODEL || "gpt-4-turbo",
             messages: sessions[sessionId],
         };
 
-        // 只有在需要时才向模型提供工具信息
         if (needsFiltering) {
             apiRequestOptions.tools = tools;
             apiRequestOptions.tool_choice = "auto";
         }
         
-        // 第一步：让 LLM 规划（根据条件可能包含工具）
         const plannerResponse = await openai.chat.completions.create(apiRequestOptions);
         const responseMessage = plannerResponse.choices[0].message;
 
-        // 获取并规范化 tool_calls
         let toolCallsToProcess = responseMessage.tool_calls || [];
 
-        // 如果标准 tool_calls 为空，但 content 中有内容，则尝试从 content 中解析
         if (toolCallsToProcess.length === 0 && responseMessage.content) {
             console.log("未找到标准 tool_calls，尝试从 content 内容中规范化...");
             const normalizedCalls = await normalizeToolCallsWithLlm(responseMessage.content);
             if (normalizedCalls.length > 0) {
                 toolCallsToProcess = normalizedCalls;
-                // 将规范化后的结果附加到消息上，以保持历史记录的完整性
                 responseMessage.tool_calls = normalizedCalls;
                 console.log("已成功从 content 中规范化工具调用。");
             }
@@ -145,28 +190,81 @@ router.post('/generate-react', async (req, res) => {
             console.log("助手决定使用工具，开始执行...");
             await handleReactToolCalls(toolCallsToProcess, sessionId);
 
-            console.log("工具执行完毕，启动 LLM 整合结果...");
-            const finalResponse = await openai.chat.completions.create({
-                model: process.env.OPENAI_MODEL || "qwen3-coder",
-                messages: sessions[sessionId],
-                temperature: 0,
-            });
+            // --- 新增：代码生成、验证与修复循环 ---
+            let finalReactCode = "";
+            let isCodeValid = false;
+            let attempts = 0;
+            const maxAttempts = 3;
 
-            let reactCode = finalResponse.choices[0].message.content || "";
-            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\\n/i, '').replace(/\\n```$/, '');
+            console.log("工具执行完毕，启动 LLM 整合与验证循环...");
 
-            sessions[sessionId].push(finalResponse.choices[0].message);
-            console.log("整合结果完成 ✅")
-            res.json({ success: true, reactCode, sessionId });
+            while (!isCodeValid && attempts < maxAttempts) {
+                attempts++;
+                console.log(`--- 开始第 ${attempts}/${maxAttempts} 次代码生成与验证 ---`);
+                
+                let generatedCode = "";
+                try {
+                    // 步骤 1: 生成代码
+                    const finalResponse = await openai.chat.completions.create({
+                        model: process.env.OPENAI_MODEL || "qwen3-coder",
+                        messages: sessions[sessionId],
+                        temperature: 0.1 * attempts, // 每次重试稍微增加一点随机性
+                    });
+
+                    generatedCode = finalResponse.choices[0].message.content || "";
+                    generatedCode = generatedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
+                    
+                    // 将本次生成结果存入会话，以便下次生成时模型能看到历史记录
+                    sessions[sessionId].push(finalResponse.choices[0].message);
+
+                    // 步骤 2: 验证JSX语法
+                    console.log("步骤 2/3: 验证JSX语法...");
+                    await validateJsxSyntax(generatedCode);
+                    console.log("✅ JSX语法正确。");
+
+                    // 步骤 3: 检查并修复未声明的变量
+                    console.log("步骤 3/3: 检查并修复未声明的变量...");
+                    finalReactCode = await fixUndeclaredVariables(generatedCode);
+                    console.log("✅ 变量修复完成。");
+                    
+                    isCodeValid = true; // 所有步骤成功，退出循环
+
+                } catch (error) {
+                    console.warn(`第 ${attempts} 次尝试失败: ${error.message}`);
+                    finalReactCode = generatedCode || (error.code || "生成代码为空"); // 保存失败的代码用于返回
+                    
+                    // 将错误信息也加入会话，告知模型上次为何失败
+                    sessions[sessionId].push({
+                        role: "user",
+                        content: `你上次生成的代码存在以下错误，请修复它并重新生成：\n${error.message}`
+                    });
+
+                    if (attempts >= maxAttempts) {
+                        console.error("已达到最大尝试次数，将返回最后一次的错误结果。");
+                    }
+                }
+            }
+            
+            if (isCodeValid) {
+                console.log("整合与验证成功 ✅")
+                res.json({ success: true, reactCode: finalReactCode, sessionId });
+            } else {
+                res.status(500).json({
+                    success: false,
+                    error: "代码生成失败，已达到最大重试次数。",
+                    reactCode: finalReactCode, // 返回最后一次生成的（错误）代码
+                    sessionId
+                });
+            }
 
         } else {
-            console.log("助手未调用工具，直接返回内容。");
+            console.log("助手未调用工具，直接返回内容（跳过验证）。");
             let reactCode = responseMessage.content || "";
-            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\\n/i, '').replace(/\\n```$/, '');
+            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
             res.json({
                 success: true,
                 reactCode,
-                warning: "模型没有调用过滤工具，结果可能不准确。",
+                warning: "模型没有调用过滤工具，结果可能不准确且未经验证。",
                 sessionId
             });
         }

@@ -391,6 +391,33 @@ function extractTagContent(code, tagType) {
     }
 }
 
+// === 通用 Style 修复（由大模型完成） ===
+const STYLE_FIX_SYSTEM_PROMPT = `
+你是一名资深前端工程师与 CSS/React 样式专家。任务：把输入的内联 style 字符串修复为 React 可用的 inline-style 对象（仅输出 JSON 对象，不要包裹代码块）。
+【必须遵守】
+1) 只输出 JSON 对象（不能有多余文本/注释/Markdown）。
+2) key 使用 React 驼峰：font-size->fontSize, background-color->backgroundColor。
+3) 移除旧 IE/浏览器 hack：前缀 _、*，以及值中的 \\9、\\0、\\9\\0；忽略 \`!important\`（安全丢弃）。
+4) 处理大小写与空格：属性名小写再转驼峰；值标准化（如 px 大写转小写）。
+5) 单位补全（常见长度）：当值是纯数字且属性为长度类（width/height/top/left/right/bottom/margin*、padding*、borderWidth、borderRadius、fontSize、letterSpacing 等），补全 "px"。
+   - 例外保持数字：opacity, zIndex, fontWeight, lineHeight（允许数字）。
+6) 颜色：原样保留（可小写化），如 #FFF -> #fff；命名色保留为小写（red/blue）。
+7) 简写展开（能判断则展开）：margin/padding/border-radius 等 1~4 值写法，展开为 top/right/bottom/left 四个属性；无法判断时可原样保留为一个字符串。
+8) 过滤无效键：明显不是 CSS 的键直接忽略（但不要臆造新键）。
+9) 不要返回 null/undefined，缺失则不含该键即可。
+输出示例：
+{"paddingLeft":"10px","color":"red","fontSize":"14px","width":"100px"}
+`
+function buildStyleFixUserPrompt(style, context) {
+    return `
+【输入的 style 字符串】
+${style}
+
+【上下文（可选）】
+${context || "（无）"}
+
+请严格输出一个 JSON 对象，键是 React 驼峰属性，值是字符串或数字。`;
+}
 
 // --- 【核心修改 1】: 重构工具函数，变为一个智能分发器 ---
 export const availableTools = {
@@ -455,6 +482,44 @@ export const availableTools = {
             console.error("Error calling OpenAI API:", error);
             return JSON.stringify({ error: "Failed to process the request with OpenAI." });
         }
+    },
+    /**
+   * 使用大模型将任意 style 字符串修复为 React 可用的 JSON 样式对象
+   * @param {object} params
+   * @param {string} params.style - 原始 style 字符串
+   * @param {string} [params.context] - 可选上下文（元素标签/类名/用途），辅助判断单位与展开
+   * @returns {Promise<string>} 仅包含样式对象的 JSON 字符串
+   */
+    normalizeStyleWithLlm: async ({ style, context = "" }) => {
+        if (!style || typeof style !== "string") {
+            return JSON.stringify({});
+        }
+
+        try {
+            const resp = await openai.chat.completions.create({
+                model: process.env.OPENAI_MODEL || "qwen3-coder",
+                temperature: 0,
+                messages: [
+                    { role: "system", content: STYLE_FIX_SYSTEM_PROMPT },
+                    { role: "user", content: buildStyleFixUserPrompt(style, context) }
+                ],
+            });
+
+            let out = resp.choices[0]?.message?.content?.trim() || "{}";
+            // 兼容偶发代码块包裹
+            if (out.startsWith("```")) {
+                out = out.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
+            }
+            // 简单校验：必须是以 { 开头以 } 结尾
+            if (!out.startsWith("{") || !out.endsWith("}")) {
+                // 兜底：返回空对象，避免影响主流程
+                return JSON.stringify({});
+            }
+            return out;
+        } catch (e) {
+            console.error("normalizeStyleWithLlm error:", e);
+            return JSON.stringify({});
+        }
     }
 };
 
@@ -474,6 +539,21 @@ export const tools = [
                     }
                 },
                 required: ["content"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "normalizeStyleWithLlm",
+            description: "将不规范的 style 字符串清洗并转为 React 内联样式对象（JSON）。可处理旧 IE hack、大小写、缺失单位、连字符->驼峰，以及常见简写展开。",
+            parameters: {
+                type: "object",
+                properties: {
+                    style: { type: "string", description: "原始 style 字符串" },
+                    context: { type: "string", description: "可选：元素信息（如 <td>、class 名、用途等），帮助判断单位与展开" }
+                },
+                required: ["style"]
             }
         }
     }
