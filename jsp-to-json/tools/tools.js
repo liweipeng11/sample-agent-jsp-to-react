@@ -1,0 +1,480 @@
+import OpenAI from "openai";
+import dotenv from 'dotenv';
+dotenv.config();
+
+// 初始化 OpenAI 客户端
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.OPENAI_API_BASE
+});
+
+/**
+ * 提示词注册表 (Prompt Registry)
+ * --------------------------------
+ * 这里是所有不同 JSP 标签转换规则的核心。
+ * - 键 (Key): 标签的唯一标识符 (例如: "jsp:include", "c:if", "html")。
+ * - 值 (Value): 一个包含 systemPrompt 和 userPromptTemplate 的对象。
+ *
+ * 要支持一个新的标签，你只需要在这里添加一个新的条目即可。
+ */
+const promptRegistry = {
+    "jsp:include": {
+        systemPrompt: `你是一个精通JSP到JSON转换的专家级程序员。你的任务是严格按照用户提供的规则，将JSP代码片段转换为指定的JSON对象，并且只输出纯粹的JSON结果。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的JSP代码片段精确地转换为指定的JSON格式。
+
+**转换规则:**
+1.  **tagName**:
+    *   如果JSP标签是引入一个组件（如 \`<jsp:include>\`），则 \`tagName\` 的值是根据其 \`page\` 属性生成的组件名（首字母大写）。
+    *   对于所有其他标准HTML标签（如 \`<div>\`, \`<p>\` 等），\`tagName\` 就是其小写的标签名。
+2.  **attributes**:
+    *   将JSP标签的所有属性转换为一个键值对，作为 \`attributes\` 对象的值。
+    *   **特殊处理**: 如果属性名为 \`style\`，其值（例如 \`"color:red; font-size:14px"\`）必须被解析成一个CSS-in-JS风格的JSON对象（例如 \`{"color":"red", "fontSize":"14px"}\`）。所有其他属性的值保持为字符串。
+3.  **isComponent**: 当JSP标签是引入一个可复用页面组件时（如 \`<jsp:include>\`），该值为 \`true\`，否则为 \`false\`。
+4.  **componentUrl**:
+    *   此字段仅在 \`isComponent\` 为 \`true\` 时存在。
+    *   其值由 \`@/pages\` + \`page\` 属性的路径（去掉文件名） + 转换后的组件名 + \`.jsx\` 构成。
+    *   例如：如果 \`page="/admin/user.jsp"\`，则 \`componentUrl\` 为 \`"@/pages/admin/User.jsx"\`。
+5.  **condition**: 如果JSP标签被包含在逻辑判断中，则提取该判断条件；否则，此字段为空字符串 \`""\`。
+6.  **children**: 如果标签内有子标签，则递归地将它们转换为JSON对象并放入此数组；否则，数组为空 \`[]\`。
+7.  **特殊处理 \`<jsp:param>\`**: 此标签自身不被转换为独立的JSON对象。它的 \`name\` 和 \`value\` 属性应该被提取出来，作为键值对直接添加到其父级标签的 \`attributes\` 对象中。
+
+**输出要求:**
+- 严格按照规则输出JSON。
+- 不要输出任何介绍、解释、注释或markdown代码块标记。
+- 只输出纯粹的、可以直接被JavaScript的 \`JSON.parse()\` 方法解析的JSON对象字符串。
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
+    "c:if": {
+        systemPrompt: `你是一个专门处理JSTL c:if 标签的专家。你的任务是将 c:if 标签及其内容转换为一个特定的JSON结构，用于表示条件渲染。`,
+        userPromptTemplate: (content) => `
+**任务:** 将 <c:if> 标签转换为JSON。
+
+**规则:**
+1.  **tagName**: 固定为 "ConditionalBlock"。
+2.  **condition**: 提取 \`test\` 属性中的EL表达式作为字符串。
+3.  **children**: 递归处理 \`<c:if>\` 内部的所有子节点。
+
+---
+**现在，请转换以下JSP代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
+    "html": {
+        systemPrompt: `你是一位精通JSP、Struts 1，并且深刻理解如何将旧版代码迁移到现代React框架的专家级前端架构师。你的任务是将Struts的 'html' 标签库转换为一个“React友好”的JSON中间表示（IR）。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的 Struts 'html' 标签库代码片段，转换为一个旨在最终生成 React JSX 的、结构清晰的JSON对象。
+
+**核心转换理念:**
+你转换的目标不是1:1的字面翻译，而是要捕捉其“意图”，并将其映射到现代HTML5和React的最佳实践上。
+
+**通用转换规则:**
+1.  **tagName**: 将 Struts 标签转换为其最语义化的、现代小写 HTML5 标签名。
+2.  **attributes**:
+    *   迁移所有标准 HTML 属性（如 \`class\`, \`id\`, \`onclick\` 等）。
+    *   **Style属性**: 将 \`style\` 字符串 (\`"width:100px; color:red"\`) 解析为 React 的内联样式对象 (\`{"width":"100px", "color":"red"}\`)。
+    *   **Property属性 (关键)**: Struts 的 \`property\` 属性用于数据绑定。为了适配React的状态管理，它的值**必须**被映射到标准的 \`name\` 属性上。同时保留原始的 \`property\` 属性用于追溯。
+3.  **isComponent**: 对于所有由 Struts 'html' 标签转换而来的元素，此值始终为 \`false\`。
+4.  **children**: 递归处理所有子节点。
+    * 如果子节点是普通标签，按规则继续转换。
+    * 如果子节点是纯文本（例如 \`<html:link>Click</html:link>\` 里的 \`Click\`），必须转换为一个对象：
+      \`\`\`json
+      {"tagName":"#text","text":"Click","attributes":{},"children":[],"isComponent":false}
+      \`\`\`
+
+**特定标签映射规则 (React-aware):**
+*   \`<html:form action="...">\` 转换为 \`{"tagName": "form", ...}\`。
+*   \`<html:text property="user" />\` 转换为 \`{"tagName": "input", "attributes": {"type": "text", "property": "user", "name": "user"}}\`。
+*   \`<html:password property="pass" />\` 转换为 \`{"tagName": "input", "attributes": {"type": "password", "property": "pass", "name": "pass"}}\`。
+*   \`<html:textarea property="desc" />\` 转换为 \`{"tagName": "textarea", "attributes": {"property": "desc", "name": "desc"}}\`。
+*   \`<html:submit value="Login" />\` 转换为 \`{"tagName": "button", "attributes": {"type": "submit"}, "text": "Login"}\` (使用 \`<button>\` 更灵活)。
+*   \`<html:link href="/p">Go</html:link>\` 转换为 \`{"tagName": "a", "attributes": {"href": "/p"}, "text": "Go"}\`。
+*   **\`<html:errors />\` (新规则): 这是一个占位符。将其转换为一个带有特定类名的空 \`<div>\`，并在内部添加注释文本。**
+
+**输出要求:**
+- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
+- 绝不输出任何解释、注释或Markdown代码块标记。
+
+---
+
+**示例 1: 包含数据绑定的输入框**
+输入 JSP: <html:text property="username" style="width:200px;" maxlength="50" />
+输出 JSON: {"tagName":"input","attributes":{"type":"text","property":"username","name":"username","style":{"width":"200px"},"maxlength":"50"},"children":[],"isComponent":false}
+
+**示例 2: 表单和错误占位符**
+输入 JSP: <html:form action="/login.do"><html:errors/><html:submit value="Login"/></html:form>
+输出 JSON: {"tagName":"form","attributes":{"action":"/login.do"},"children":[{"tagName":"FormErrors","attributes":{},"children":[],"isComponent":false},{"tagName":"button","attributes":{"type":"submit"},"children":[],"isComponent":false,"text":"Login"}],"isComponent":false}
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
+    // --- 【新增】: 支持废弃的 <font> 标签 ---
+    "font": {
+        systemPrompt: `你是一位专注于将过时HTML代码现代化的前端重构专家。你的任务是将废弃的 <font> 标签精确地转换为使用内联CSS样式的JSON对象表示。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的 <font> 标签及其属性，转换为一个代表 <span> 元素的、使用CSS-in-JS风格样式的JSON对象。
+
+**核心转换理念:**
+<font> 标签已被废弃，其功能应由CSS完全取代。转换的目标是保留其视觉样式，同时升级到现代、标准的HTML结构。
+
+**转换规则:**
+1.  **tagName**: 始终将 <font> 标签转换为 "span"。这是一个中性的内联元素，非常适合应用样式。
+2.  **attributes**:
+    *   创建一个名为 "style" 的对象，用于存放所有样式属性。
+    *   **color**: 将 \`color\` 属性的值直接映射到 \`style.color\`。
+    *   **face**: 将 \`face\` 属性的值直接映射到 \`style.fontFamily\` (注意使用驼峰命名)。
+    *   **size (关键)**: 将 \`size\` 属性 (值从1-7) 转换为对应的 \`fontSize\` 值。使用以下精确的像素映射规则：
+        *   \`size="1"\`: \`"10px"\` (x-small)
+        *   \`size="2"\`: \`"13px"\` (small)
+        *   \`size="3"\`: \`"16px"\` (medium - 默认)
+        *   \`size="4"\`: \`"18px"\` (large)
+        *   \`size="5"\`: \`"24px"\` (x-large)
+        *   \`size="6"\`: \`"32px"\` (xx-large)
+        *   \`size="7"\`: \`"48px"\` (larger)
+    *   如果其他属性（如 \`class\`, \`id\`）存在，也应保留在 \`attributes\` 中，与 \`style\` 对象同级。
+3.  **isComponent**: 始终为 \`false\`。
+4.  **children**: 递归处理所有子节点。
+5.  **text**: 如果标签内部直接包含文本内容，则将该文本放入顶层的 \`text\` 字段。
+
+**输出要求:**
+- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
+- 绝不输出任何解释、注释或Markdown代码块标记。
+
+---
+
+**示例 1: 基本用法**
+输入 JSP: <font color="blue" face="Arial" size="4">这是一个标题</font>
+输出 JSON: {"tagName":"span","attributes":{"style":{"color":"blue","fontFamily":"Arial","fontSize":"18px"}},"children":[],"isComponent":false,"text":"这是一个标题"}
+
+**示例 2: 只有颜色**
+输入 JSP: <font color="#FF0000">错误信息</font>
+输出 JSON: {"tagName":"span","attributes":{"style":{"color":"#FF0000"}},"children":[],"isComponent":false,"text":"错误信息"}
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
+    // --- 【新增】: 支持 Struts 'logic' 标签库 ---
+    "logic": {
+        systemPrompt: `你是一位精通 Struts 1 'logic' 标签库的专家，任务是将这些旧版的逻辑控制标签，转换为一个现代前端框架（如 React）能够理解的、结构化的 JSON 中间表示（IR）。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的 Struts 'logic' 标签库代码片段，转换为一个能清晰表达其“循环”或“条件”意图的JSON对象。
+
+**核心转换理念:**
+捕捉 Struts 'logic' 标签的本质功能——迭代和条件渲染，并用一个通用的、与具体实现无关的JSON结构来表示它。
+
+**特定标签映射规则:**
+
+1.  **\`<logic:iterate>\` (循环)**:
+    *   **tagName**: 固定为字符串 \`"LoopBlock"\`。
+    *   **collection**: 提取 \`name\` 或 \`property\` 属性的值，它代表要迭代的集合的名称。
+    *   **item**: 提取 \`id\` 属性的值，它代表循环中每个元素的变量名。
+    *   **children**: 递归处理 \`<logic:iterate>\` 标签内部的所有子节点，并将结果放入此数组。
+
+2.  **条件标签 (如 \`<logic:equal>\`, \`<logic:notEqual>\`, \`<logic:present>\` 等)**:
+    *   **tagName**: 固定为字符串 \`"ConditionalBlock"\`。
+    *   **condition**: 将标签的意图和属性组合成一个易于理解的条件表达式字符串。
+        *   \`<logic:equal name="user" property="role" value="admin">\` -> \`"user.role == 'admin'"\`
+        *   \`<logic:notEqual name="status" value="0">\` -> \`"status != '0'"\`
+        *   \`<logic:present name="user">\` -> \`"isPresent(user)"\`
+        *   \`<logic:notPresent name="user">\` -> \`"!isPresent(user)"\`
+        *   \`<logic:greaterThan name="count" value="10">\` -> \`"count > 10"\`
+    *   **children**: 递归处理条件标签内部的所有子节点。
+
+**输出要求:**
+- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
+- 绝不输出任何解释、注释或Markdown代码块标记。
+
+---
+
+**示例 1: 循环标签**
+输入 JSP:
+\`\`\`jsp
+<logic:iterate id="item" name="userList">
+  <p>用户名: <bean:write name="item" property="name" /></p>
+</logic:iterate>
+\`\`\`
+输出 JSON:
+\`\`\`json
+{"tagName":"LoopBlock","collection":"userList","item":"item","children":[{"tagName":"p","attributes":{},"children":[],"isComponent":false,"text":"用户名: <bean:write name=\\"item\\" property=\\"name\\" />"}]}
+\`\`\`
+
+**示例 2: 条件标签**
+输入 JSP:
+\`\`\`jsp
+<logic:equal name="user" property="role" value="admin">
+  <a href="/admin">管理后台</a>
+</logic:equal>
+\`\`\`
+输出 JSON:
+\`\`\`json
+{"tagName":"ConditionalBlock","condition":"user.role == 'admin'","children":[{"tagName":"a","attributes":{"href":"/admin"},"children":[],"isComponent":false,"text":"管理后台"}]}
+\`\`\`
+
+**示例 3: 存在性判断**
+输入 JSP:
+\`\`\`jsp
+<logic:present name="errorMessages">
+  <div class="error">请修正错误</div>
+</logic:present>
+\`\`\`
+输出 JSON:
+\`\`\`json
+{"tagName":"ConditionalBlock","condition":"isPresent(errorMessages)","children":[{"tagName":"div","attributes":{"class":"error"},"children":[],"isComponent":false,"text":"请修正错误"}]}
+\`\`\`
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
+    // --- 【最终架构版】: 忽略ContextPath，移除.do后缀，区分组件/路由 ---
+    "frameset": {
+        systemPrompt: `你是一位顶尖的前端架构师，专注于将过时的JSP/Struts架构向现代React SPA迁移。你的任务是将废弃的 <frameset> 布局，精准地转换为一个能够生成干净、现代化路由的JSON中间表示（IR）。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的 <frameset> 及其内部的 <frame> 标签，转换为一个代表现代React布局与路由结构的、单一的JSON对象。
+
+**核心转换理念:**
+- **<frameset> -> 布局容器**: 转换为使用CSS Grid的 \`<div>\`。
+- **<frame src="... .jsp"> -> 组件槽**: 代表直接渲染一个“视图组件”。
+- **<frame src="... .do"> -> 路由槽**: 代表该区域是一个“路由出口”（Route Outlet）。
+- **路径清理 (关键)**:
+    1.  **忽略 Context Path**: 必须完全忽略和移除 \`<%=request.getContextPath()%> \` 表达式。
+    2.  **移除 .do 后缀**: 来自 Struts 的 \`.do\` 路由必须被转换为干净、无后缀的现代路由路径。
+
+**转换规则:**
+
+1.  **顶层 \`<frameset>\` 标签:**
+    *   **tagName**: \`"div"\`。
+    *   **isComponent**: \`false\`。
+    *   **attributes**:
+        *   创建 \`"style"\` 对象并设置 \`"display": "grid"\`。
+        *   根据 \`rows\`/\`cols\` 生成 \`gridTemplateRows\`/\`gridTemplateColumns\`。
+        *   转换 \`on...\` 事件为驼峰格式。
+    *   **children**: 包含所有 \`<frame>\` 转换后的JSON对象。
+
+2.  **内部 \`<frame>\` 标签 (分类处理):**
+
+    *   **预处理**: 在分析 \`src\` 属性前，必须先执行两个清理步骤：
+        1.  移除所有的 \`<%=request.getContextPath()%>\` 部分。
+        2.  如果路径以 \`.do\` 结尾，则移除 \`.do\` 后缀。
+        *   例如: \`src="<%=request.getContextPath()%>/users/home.do"\` 应被视为纯粹的路径 \`"/users/home"\`。
+
+    *   **Case A: 清理后的 \`src\` 指向视图模板 (e.g., \`.jsp\`)**
+        *   视为 **“组件”**。
+        *   **tagName**: 根据文件名生成驼峰组件名 (e.g., \`slogin.jsp\` -> \`Slogin\`)。
+        *   **isComponent**: \`true\`。
+        *   **componentUrl**: 生成对应的 \`.jsx\` 路径。
+        *   **attributes.page**: 将清理后的 \`.jsp\` 路径赋值给 \`page\` 属性。
+
+    *   **Case B: 清理后的 \`src\` 是一个路由路径 (原为 \`.do\`)**
+        *   视为 **“路由”**。
+        *   **tagName**: 固定为 \`"RouteOutlet"\`。
+        *   **isComponent**: \`true\`。
+        *   **attributes.defaultRoute**: 将清理后的、无后缀的路径作为字符串值赋给此属性。
+
+    *   **Case C: 空 \`src\`**
+        *   如果 \`src=""\`，转换为一个占位的 \`<div>\`。
+
+**输出要求:**
+- 严格按照规则输出单一、纯粹、可被 \`JSON.parse()\` 解析的JSON对象。
+- 绝不输出任何解释、注释或Markdown代码块标记。
+
+---
+
+**示例:**
+输入 JSP:
+\`\`\`jsp
+<frameset rows="80,*,0" onunload="javascript:logout()">
+  <frame src="top.jsp" name="top">
+  <frame src="<%=request.getContextPath()%>/users/home.do" name="main">
+  <frame src="">
+</frameset>
+\`\`\`
+输出 JSON:
+\`\`\`json
+{"tagName":"div","isComponent":false,"attributes":{"style":{"display":"grid","gridTemplateRows":"80px 1fr 0px"},"onUnload":"javascript.logout()"},"children":[{"tagName":"Top","isComponent":true,"componentUrl":"@/pages/Top.jsx","attributes":{"page":"top.jsp","name":"top"},"children":[]},{"tagName":"RouteOutlet","isComponent":true,"attributes":{"defaultRoute":"/users/home","name":"main"},"children":[]},{"tagName":"div","isComponent":false,"attributes":{"data-comment":"Placeholder for empty frame"},"children":[]}]}
+\`\`\`
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    }
+};
+
+
+/**
+ * @description 从JSP代码片段中检测主要的标签类型
+ * @param {string} code - JSP代码字符串
+ * @returns {string|null} - 返回识别到的标签名或标签族 (例如 "jsp:include", "html", "font") 或 null
+ */
+// --- 【修改】: 更新检测逻辑以支持 <font> 等无前缀标签 ---
+/**
+ * 扫描片段，找到第一个属于 promptRegistry 的标签类型
+ */
+function detectMainTagType(code) {
+    const trimmedCode = code.trim();
+
+    // 匹配所有带前缀的标签 (如 <jsp:include>, <html:text>)
+    const prefixTagMatches = [...trimmedCode.matchAll(/<([a-zA-Z0-9]+:[a-zA-Z0-9]+)/g)];
+    for (const m of prefixTagMatches) {
+        const fullTag = m[1].toLowerCase();
+        if (promptRegistry.hasOwnProperty(fullTag)) {
+            return fullTag;
+        }
+    }
+
+    // 匹配所有无前缀的标签 (如 <font>, <table>)
+    const standardTagMatches = [...trimmedCode.matchAll(/<([a-zA-Z0-9]+)/g)];
+    for (const m of standardTagMatches) {
+        const tagName = m[1].toLowerCase();
+        if (promptRegistry.hasOwnProperty(tagName)) {
+            return tagName;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * 提取指定标签的完整片段（包括子节点）
+ */
+function extractTagContent(code, tagType) {
+    // 区分是否有前缀（如 html:text / jsp:include）
+    const [prefix, tagName] = tagType.includes(":") ? tagType.split(":") : [null, tagType];
+
+    if (!prefix) {
+        // 普通标签（如 font, table, div）
+        const regex = new RegExp(`<${tagName}\\b[^>]*>[\\s\\S]*?<\\/${tagName}>`, "i");
+        const match = code.match(regex);
+        return match ? match[0] : null;
+    } else {
+        // 前缀标签（如 jsp:include, html:text）
+        const regex = new RegExp(`<${prefix}:${tagName}\\b[^>]*>([\\s\\S]*?<\\/${prefix}:${tagName}>)?`, "i");
+        const match = code.match(regex);
+        return match ? match[0] : null;
+    }
+}
+
+
+// --- 【核心修改 1】: 重构工具函数，变为一个智能分发器 ---
+export const availableTools = {
+    /**
+     * @description 接收任何JSP代码片段，内部判断其类型并调用相应的LLM处理流程。
+     * @param {object} params - 参数对象
+     * @param {string} params.content - 需要转换的JSP代码片段
+     * @returns {Promise<string>} 转换后的JSON字符串，或一个包含错误的JSON字符串
+     */
+    convertJspSnippet: async ({ content }) => {
+        if (!content) {
+            return JSON.stringify({ error: "Missing content parameter." });
+        }
+
+        // 1. 在工具内部识别标签类型
+        const detectedTagType = detectMainTagType(content);
+
+        if (!detectedTagType) {
+            return JSON.stringify({ error: "未识别出受支持的标签类型。" });
+        }
+
+        console.log(`检测到JSP标签类型: ${detectedTagType}`);
+
+        // 提取该标签的完整内容
+        const snippet = extractTagContent(content, detectedTagType) || content;
+
+        // 2. 从注册表中查找对应的提示词
+        const prompts = promptRegistry[detectedTagType];
+        if (!prompts) {
+            // 3. 如果标签不受支持，立即返回错误
+            return JSON.stringify({
+                error: `Unsupported tag type: '${detectedTagType}'. This tool currently only supports: [${Object.keys(promptRegistry).join(', ')}]`
+            });
+        }
+
+        // 4. 如果找到匹配的规则，则继续调用 OpenAI API
+        const systemPrompt = prompts.systemPrompt;
+        const userPrompt = prompts.userPromptTemplate(snippet);
+
+        try {
+            const response = await openai.chat.completions.create({
+                model: process.env.OPENAI_MODEL || "qwen3-coder",
+                messages: [
+                    { "role": "system", "content": systemPrompt },
+                    { "role": "user", "content": userPrompt }
+                ],
+                temperature: 0
+            });
+
+            let responseContent = response.choices[0].message.content;
+
+            // 后处理逻辑保持不变
+            if (responseContent.startsWith('```json')) {
+                responseContent = responseContent.substring(7, responseContent.length - 3).trim();
+            } else if (responseContent.startsWith('```')) {
+                responseContent = responseContent.substring(3, responseContent.length - 3).trim();
+            }
+
+            return responseContent;
+
+        } catch (error) {
+            console.error("Error calling OpenAI API:", error);
+            return JSON.stringify({ error: "Failed to process the request with OpenAI." });
+        }
+    }
+};
+
+// --- 【核心修改 2】: 简化提供给 OpenAI 的工具定义 ---
+export const tools = [
+    {
+        type: "function",
+        function: {
+            name: "convertJspSnippet", // 新的、更通用的函数名
+            description: "当需要将一小段特定的标签片段转换为JSON结构时调用此工具。特别适用于处理JSP自定义标签（如 <jsp:include>, <c:if>），Struts标签库（如 <html:text>, <logic:iterate>），以及需要现代化的、已废弃的HTML标签（如 <font>, <frameset>）。",
+            parameters: {
+                type: "object",
+                properties: {
+                    content: {
+                        type: "string",
+                        description: "需要转换的、完整的JSP代码片段。例如：'<logic:iterate id=\"item\" name=\"userList\"><p>{item.name}</p></logic:iterate>' 或 '<frameset rows=\"0,*\"><frame src=\"page.jsp\"></frameset>'"
+                    }
+                },
+                required: ["content"]
+            }
+        }
+    }
+];
