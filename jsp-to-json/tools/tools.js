@@ -8,6 +8,64 @@ const openai = new OpenAI({
     baseURL: process.env.OPENAI_API_BASE
 });
 
+// --- 工具函数：解析 style 属性为对象 ---
+function parseStyle(styleString) {
+    if (!styleString) return {};
+    return styleString.split(";").reduce((acc, decl) => {
+        const [rawKey, rawValue] = decl.split(":");
+        if (!rawKey || !rawValue) return acc;
+        const key = rawKey.trim().replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        acc[key] = rawValue.trim();
+        return acc;
+    }, {});
+}
+
+// --- 【新增】: 专门处理 jsp:include ---
+function convertJspInclude(snippet) {
+    snippet = snippet.replace(/\\"/g, '"');
+    const attrRegex = /(\w+)="([^"]*)"/g;
+    const attributes = {};
+    let match;
+    let pageAttr = null;
+
+    while ((match = attrRegex.exec(snippet)) !== null) {
+        const name = match[1];
+        const value = match[2];
+        if (name === "page") {
+            pageAttr = value;
+        } else if (name === "style") {
+            attributes.style = parseStyle(value);
+        } else {
+            attributes[name] = value;
+        }
+    }
+
+    if (!pageAttr) {
+        return JSON.stringify({ error: "jsp:include 缺少 page 属性" });
+    }
+
+    // 生成组件名（首字母大写，去掉扩展名）
+    const fileName = pageAttr.split("/").pop().replace(/\.jsp$/i, "");
+    const componentName = fileName.charAt(0).toUpperCase() + fileName.slice(1);
+
+    // 生成 componentUrl
+    let componentUrl;
+    if (pageAttr.startsWith("/")) {
+        const dir = pageAttr.split("/").slice(0, -1).join("/");
+        componentUrl = `@/pages${dir}/${componentName}.jsx`;
+    } else {
+        componentUrl = `./${componentName}.jsx`;
+    }
+
+    return JSON.stringify({
+        tagName: componentName,
+        attributes,
+        isComponent: true,
+        componentUrl,
+        children: []
+    });
+}
+
 /**
  * 提示词注册表 (Prompt Registry)
  * --------------------------------
@@ -25,16 +83,15 @@ const promptRegistry = {
 
 **转换规则:**
 1.  **tagName**:
-    *   如果JSP标签是引入一个组件（如 \`<jsp:include>\`），则 \`tagName\` 的值是根据其 \`page\` 属性生成的组件名（首字母大写）。
-    *   对于所有其他标准HTML标签（如 \`<div>\`, \`<p>\` 等），\`tagName\` 就是其小写的标签名。
+    *   根据其 \`page\` 属性生成组件名（首字母大写）。
 2.  **attributes**:
-    *   将JSP标签的所有属性转换为一个键值对，作为 \`attributes\` 对象的值。
-    *   **特殊处理**: 如果属性名为 \`style\`，其值（例如 \`"color:red; font-size:14px"\`）必须被解析成一个CSS-in-JS风格的JSON对象（例如 \`{"color":"red", "fontSize":"14px"}\`）。所有其他属性的值保持为字符串。
-3.  **isComponent**: 当JSP标签是引入一个可复用页面组件时（如 \`<jsp:include>\`），该值为 \`true\`，否则为 \`false\`。
-4.  **componentUrl**:
-    *   此字段仅在 \`isComponent\` 为 \`true\` 时存在。
-    *   其值由 \`@/pages\` + \`page\` 属性的路径（去掉文件名） + 转换后的组件名 + \`.jsx\` 构成。
-    *   例如：如果 \`page="/admin/user.jsp"\`，则 \`componentUrl\` 为 \`"@/pages/admin/User.jsx"\`。
+    *   将JSP标签的所有属性（**除了 \`page\` 属性**）转换为一个键值对，作为 \`attributes\` 对象的值。\`page\` 属性仅用于生成组件名和路径，不应出现在最终的 attributes 中。
+    *   **特殊处理**: 如果属性名为 \`style\`，其值（例如 \`"color:red; font-size:14px"\`）必须被解析成一个CSS-in-JS风格的JSON对象（例如 \`{"color":"red", "fontSize":"14px"}\`）。
+3.  **isComponent**: 始终为 \`true\`。
+4.  **componentUrl (重要路径规则)**:
+    *   其值由 \`page\` 属性的路径决定：
+        *   如果 \`page\` 属性以 \`/\` 开头 (例如 \`page="/admin/user.jsp"\`)，则 URL 为 \`"@/pages"\` + \`page\` 属性的路径（去掉文件名） + 转换后的组件名 + \`.jsx\`。示例: \`"@/pages/admin/User.jsx"\`。
+        *   如果 \`page\` 属性不以 \`/\` 开头 (例如 \`page="header.jsp"\`)，则 URL 为 \`"./"\` + 转换后的组件名 + \`.jsx\`。示例: \`"./Header.jsx"\`。
 5.  **condition**: 如果JSP标签被包含在逻辑判断中，则提取该判断条件；否则，此字段为空字符串 \`""\`。
 6.  **children**: 如果标签内有子标签，则递归地将它们转换为JSON对象并放入此数组；否则，数组为空 \`[]\`。
 7.  **特殊处理 \`<jsp:param>\`**: 此标签自身不被转换为独立的JSON对象。它的 \`name\` 和 \`value\` 属性应该被提取出来，作为键值对直接添加到其父级标签的 \`attributes\` 对象中。
@@ -43,6 +100,12 @@ const promptRegistry = {
 - 严格按照规则输出JSON。
 - 不要输出任何介绍、解释、注释或markdown代码块标记。
 - 只输出纯粹的、可以直接被JavaScript的 \`JSON.parse()\` 方法解析的JSON对象字符串。
+
+---
+
+**示例:**
+输入 JSP: <jsp:include page="/components/common/header.jsp" id="header" />
+输出 JSON: {"tagName":"Header","attributes":{"id":"header"},"isComponent":true,"componentUrl":"@/pages/components/common/Header.jsx","children":[]}
 
 ---
 
@@ -293,8 +356,8 @@ ${content}
         *   视为 **“组件”**。
         *   **tagName**: 根据文件名生成驼峰组件名 (e.g., \`slogin.jsp\` -> \`Slogin\`)。
         *   **isComponent**: \`true\`。
-        *   **componentUrl**: 生成对应的 \`.jsx\` 路径。
-        *   **attributes.page**: 将清理后的 \`.jsp\` 路径赋值给 \`page\` 属性。
+        *   **componentUrl (重要路径规则)**: 根据清理后的 \`.jsp\` 路径生成对应的 \`.jsx\` 路径。如果路径以 \`/\` 开头，基地址为 \`"@/pages"\`；否则，基地址为 \`"./"\`。
+        *   **attributes**: 包含除了 \`src\` 之外的所有其他原始属性 (例如 \`name\`, \`id\` 等)。\`src\` 属性已被用于逻辑判断和生成 \`componentUrl\`，因此不应出现在 \`attributes\` 中。
 
     *   **Case B: 清理后的 \`src\` 是一个路由路径 (原为 \`.do\`)**
         *   视为 **“路由”**。
@@ -320,9 +383,9 @@ ${content}
   <frame src="">
 </frameset>
 \`\`\`
-输出 JSON:
+输出 JSON (注意 top.jsp 转换后 attributes 中没有 page/src 属性):
 \`\`\`json
-{"tagName":"div","isComponent":false,"attributes":{"style":{"display":"grid","gridTemplateRows":"80px 1fr 0px"},"onUnload":"javascript.logout()"},"children":[{"tagName":"Top","isComponent":true,"componentUrl":"@/pages/Top.jsx","attributes":{"page":"top.jsp","name":"top"},"children":[]},{"tagName":"RouteOutlet","isComponent":true,"attributes":{"defaultRoute":"/users/home","name":"main"},"children":[]},{"tagName":"div","isComponent":false,"attributes":{"data-comment":"Placeholder for empty frame"},"children":[]}]}
+{"tagName":"div","isComponent":false,"attributes":{"style":{"display":"grid","gridTemplateRows":"80px 1fr 0px"},"onUnload":"javascript.logout()"},"children":[{"tagName":"Top","isComponent":true,"componentUrl":"./Top.jsx","attributes":{"name":"top"},"children":[]},{"tagName":"RouteOutlet","isComponent":true,"attributes":{"defaultRoute":"/users/home","name":"main"},"children":[]},{"tagName":"div","isComponent":false,"attributes":{"data-comment":"Placeholder for empty frame"},"children":[]}]}
 \`\`\`
 
 ---
@@ -441,8 +504,13 @@ export const availableTools = {
 
         console.log(`检测到JSP标签类型: ${detectedTagType}`);
 
+
         // 提取该标签的完整内容
         const snippet = extractTagContent(content, detectedTagType) || content;
+                // --- 【改造点】: jsp:include 走本地代码转换 ---
+        if (detectedTagType === "jsp:include") {
+            return convertJspInclude(content);
+        }
 
         // 2. 从注册表中查找对应的提示词
         const prompts = promptRegistry[detectedTagType];
@@ -487,7 +555,7 @@ export const availableTools = {
    * 使用大模型将任意 style 字符串修复为 React 可用的 JSON 样式对象
    * @param {object} params
    * @param {string} params.style - 原始 style 字符串
-   * @param {string} [params.context] - 可选上下文（元素标签/类名/用途），辅助判断单位与展开
+   * @param {string} [params.context] - 可选上下文（元素标签/类名/用途等），辅助判断单位与展开
    * @returns {Promise<string>} 仅包含样式对象的 JSON 字符串
    */
     normalizeStyleWithLlm: async ({ style, context = "" }) => {

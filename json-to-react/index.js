@@ -21,7 +21,7 @@ const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于�
 3. 变量使用useState声明，禁止使用useEffect初始化
 4. 事件处理函数只需定义名称，内容统一用console.log()实现
 5. 遇到body标签时仅处理其children属性
-6. 组件文件名首字母大写并使用.jsx后缀
+6. isComponent为true时为组件引用，componentUrl为组件地址
 7. 完全忽略title标签
 8. 正确解析<%...%>中的变量和条件表达式
 9. 最终输出必须是完整的JSX文件内容
@@ -185,26 +185,38 @@ router.post('/generate-react', async (req, res) => {
         }
 
         sessions[sessionId].push(responseMessage);
+        
+        const hasToolCalls = toolCallsToProcess && toolCallsToProcess.length > 0;
 
-        if (toolCallsToProcess && toolCallsToProcess.length > 0) {
+        if (hasToolCalls) {
             console.log("助手决定使用工具，开始执行...");
             await handleReactToolCalls(toolCallsToProcess, sessionId);
+        } else {
+            console.log("助手未调用工具，将对直接生成的内容进行验证。");
+        }
 
-            // --- 新增：代码生成、验证与修复循环 ---
-            let finalReactCode = "";
-            let isCodeValid = false;
-            let attempts = 0;
-            const maxAttempts = 3;
+        // --- 统一的代码生成、验证与修复循环 ---
+        let finalReactCode = "";
+        let isCodeValid = false;
+        let attempts = 0;
+        const maxAttempts = 3;
+        let generatedCode = "";
 
-            console.log("工具执行完毕，启动 LLM 整合与验证循环...");
+        console.log("启动统一的 LLM 代码生成与验证循环...");
 
-            while (!isCodeValid && attempts < maxAttempts) {
-                attempts++;
-                console.log(`--- 开始第 ${attempts}/${maxAttempts} 次代码生成与验证 ---`);
-                
-                let generatedCode = "";
-                try {
-                    // 步骤 1: 生成代码
+        while (!isCodeValid && attempts < maxAttempts) {
+            attempts++;
+            console.log(`--- 开始第 ${attempts}/${maxAttempts} 次代码生成与验证 ---`);
+            
+            try {
+                // 步骤 1: 生成或获取代码
+                // 如果是首次尝试且没有工具调用，则直接使用模型初次返回的内容。
+                // 否则，需要调用模型根据当前会话（可能包含工具结果或错误信息）来生成新代码。
+                if (attempts === 1 && !hasToolCalls) {
+                    console.log("使用模型初次生成的内容进行验证...");
+                    generatedCode = responseMessage.content || "";
+                } else {
+                    console.log("调用 LLM 生成/修复代码...");
                     const finalResponse = await openai.chat.completions.create({
                         model: process.env.OPENAI_MODEL || "qwen3-coder",
                         messages: sessions[sessionId],
@@ -212,62 +224,55 @@ router.post('/generate-react', async (req, res) => {
                     });
 
                     generatedCode = finalResponse.choices[0].message.content || "";
-                    generatedCode = generatedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
-                    
                     // 将本次生成结果存入会话，以便下次生成时模型能看到历史记录
                     sessions[sessionId].push(finalResponse.choices[0].message);
+                }
 
-                    // 步骤 2: 验证JSX语法
-                    console.log("步骤 2/3: 验证JSX语法...");
-                    await validateJsxSyntax(generatedCode);
-                    console.log("✅ JSX语法正确。");
+                generatedCode = generatedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
+                if (!generatedCode) {
+                    throw new Error("模型生成了空代码。");
+                }
 
-                    // 步骤 3: 检查并修复未声明的变量
-                    console.log("步骤 3/3: 检查并修复未声明的变量...");
-                    finalReactCode = await fixUndeclaredVariables(generatedCode);
-                    console.log("✅ 变量修复完成。");
-                    
-                    isCodeValid = true; // 所有步骤成功，退出循环
+                // 步骤 2: 验证JSX语法
+                console.log("步骤 2/3: 验证JSX语法...");
+                await validateJsxSyntax(generatedCode);
+                console.log("✅ JSX语法正确。");
 
-                } catch (error) {
-                    console.warn(`第 ${attempts} 次尝试失败: ${error.message}`);
-                    finalReactCode = generatedCode || (error.code || "生成代码为空"); // 保存失败的代码用于返回
-                    
-                    // 将错误信息也加入会话，告知模型上次为何失败
+                // 步骤 3: 检查并修复未声明的变量
+                console.log("步骤 3/3: 检查并修复未声明的变量...");
+                finalReactCode = await fixUndeclaredVariables(generatedCode);
+                console.log("✅ 变量修复完成。");
+                
+                isCodeValid = true; // 所有步骤成功，退出循环
+
+            } catch (error) {
+                console.warn(`第 ${attempts} 次尝试失败: ${error.message}`);
+                finalReactCode = generatedCode || (error.code || "生成代码为空"); // 保存失败的代码用于返回
+                
+                // 仅在还有重试机会时，将错误信息加入会话，告知模型上次为何失败
+                if (attempts < maxAttempts) {
                     sessions[sessionId].push({
                         role: "user",
                         content: `你上次生成的代码存在以下错误，请修复它并重新生成：\n${error.message}`
                     });
-
-                    if (attempts >= maxAttempts) {
-                        console.error("已达到最大尝试次数，将返回最后一次的错误结果。");
-                    }
+                } else {
+                    console.error("已达到最大尝试次数，将返回最后一次的错误结果。");
                 }
             }
-            
-            if (isCodeValid) {
-                console.log("整合与验证成功 ✅")
-                res.json({ success: true, reactCode: finalReactCode, sessionId });
-            } else {
-                res.status(500).json({
-                    success: false,
-                    error: "代码生成失败，已达到最大重试次数。",
-                    reactCode: finalReactCode, // 返回最后一次生成的（错误）代码
-                    sessionId
-                });
-            }
-
+        }
+        
+        if (isCodeValid) {
+            console.log("代码生成与验证成功 ✅")
+            res.json({ success: true, reactCode: finalReactCode, sessionId });
         } else {
-            console.log("助手未调用工具，直接返回内容（跳过验证）。");
-            let reactCode = responseMessage.content || "";
-            reactCode = reactCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
-            res.json({
-                success: true,
-                reactCode,
-                warning: "模型没有调用过滤工具，结果可能不准确且未经验证。",
+            res.status(500).json({
+                success: false,
+                error: "代码生成失败，已达到最大重试次数。",
+                reactCode: finalReactCode, // 返回最后一次生成的（错误）代码
                 sessionId
             });
         }
+
     } catch (error) {
         console.error("处理请求时出错:", error);
         res.status(500).json({ error: error.message });
