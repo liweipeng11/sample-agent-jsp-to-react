@@ -397,7 +397,72 @@ ${content}
 ${content}
 \`\`\`
 `
+    },
+    "object": {
+        systemPrompt: `你是一位处理遗留HTML代码的专家。你的任务是将使用了ActiveX控件的 <object> 标签，转换为一个明确的JSON占位符组件，并保留其所有关键信息以便后续手动替换。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的包含ActiveX控件的 <object> 标签转换为一个 "ActiveXPlaceholder" JSON组件。
+
+**核心转换理念:**
+ActiveX无法被现代浏览器支持，因此我们不能转换它，只能标记它并提取信息。目标是创建一个清晰的、信息完整的占位符，以便开发人员后续手动替换。
+
+**转换规则:**
+1.  **tagName**: 固定为字符串 \`"ActiveXPlaceholder"\`。这使得在代码库中搜索和处理这些待办项变得容易。
+2.  **isComponent**: 始终为 \`true\`。
+3.  **attributes**:
+    *   将原始 \`<object>\` 标签的所有属性（如 \`id\`, \`classid\`, \`codebase\`, \`width\`, \`height\` 等）原封不动地复制到这个对象中。
+    *   **关键**: 不要尝试解析或修改任何属性。
+4.  **children**:
+    *   查找所有 \`<param>\` 子标签。
+    *   将每个 \`<param>\` 标签的 \`name\` 和 \`value\` 属性，提取为一个键值对。
+    *   将所有这些键值对合并到一个名为 \`params\` 的单一对象中，并将其作为 \`children\` 数组的唯一元素。
+
+**输出要求:**
+- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
+- 绝不输出任何解释、注释或Markdown代码块标记。
+
+---
+
+**示例:**
+输入 JSP:
+\`\`\`jsp
+<object id="scanner" classid="clsid:...." width="100%" height="500">
+   <param name="scanUrl" value="/uploadScan.do">
+   <param name="licenseKey" value="ABC-123">
+</object>
+\`\`\`
+输出 JSON:
+\`\`\`json
+{
+  "tagName": "ActiveXPlaceholder",
+  "isComponent": true,
+  "attributes": {
+    "id": "scanner",
+    "classid": "clsid:....",
+    "width": "100%",
+    "height": "500"
+  },
+  "children": [
+    {
+      "params": {
+        "scanUrl": "/uploadScan.do",
+        "licenseKey": "ABC-123"
+      }
     }
+  ]
+}
+\`\`\`
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
 };
 
 
@@ -507,7 +572,7 @@ export const availableTools = {
 
         // 提取该标签的完整内容
         const snippet = extractTagContent(content, detectedTagType) || content;
-                // --- 【改造点】: jsp:include 走本地代码转换 ---
+        // --- 【改造点】: jsp:include 走本地代码转换 ---
         if (detectedTagType === "jsp:include") {
             return convertJspInclude(content);
         }
@@ -597,13 +662,13 @@ export const tools = [
         type: "function",
         function: {
             name: "convertJspSnippet", // 新的、更通用的函数名
-            description: "当需要将一小段特定的标签片段转换为JSON结构时调用此工具。特别适用于处理JSP自定义标签（如 <jsp:include>, <c:if>），Struts标签库（如 <html:text>, <logic:iterate>），以及需要现代化的、已废弃的HTML标签（如 <font>, <frameset>）。",
+            description: "将特定的JSP、Struts或废弃HTML标签片段转换为JSON。如果遇到以下标签，必须调用此工具：1. JSP/JSTL标签 (如 jsp:include, c:if)。2. Struts标签库 (如 html:text, logic:iterate)。3. 废弃或特殊处理的HTML标签 (如 font, frameset, 和用于ActiveX的 object)。",
             parameters: {
                 type: "object",
                 properties: {
                     content: {
                         type: "string",
-                        description: "需要转换的、完整的JSP代码片段。例如：'<logic:iterate id=\"item\" name=\"userList\"><p>{item.name}</p></logic:iterate>' 或 '<frameset rows=\"0,*\"><frame src=\"page.jsp\"></frameset>'"
+                        description: "包含需要转换的标签的完整代码片段。例如：'<object id=\"scanner\" classid=\"...\"><param name=\"url\" value=\"...\"></object>'"
                     }
                 },
                 required: ["content"]

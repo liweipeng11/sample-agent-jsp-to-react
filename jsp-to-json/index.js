@@ -64,6 +64,63 @@ function traverseAndFixTables(node) {
     }
 }
 
+/**
+ * 递归地遍历一个代表HTML树的JSON对象。
+ * 如果找到一个'object'标签（通常用于ActiveX），
+ * 它会将其转换为一个 "ActiveXPlaceholder" 组件，
+ * 并将所有 <param> 子标签的信息提取到一个 params 对象中。
+ * @param {any} node - JSON树中的当前节点（对象或数组）。
+ */
+function traverseAndTransformObjects(node) {
+    if (node === null || typeof node !== 'object') {
+        return;
+    }
+
+    if (Array.isArray(node)) {
+        // 如果是数组，则遍历数组中的每个元素
+        node.forEach(item => traverseAndTransformObjects(item));
+        return;
+    }
+
+    // 在处理当前节点之前，先递归处理其子节点
+    if (node.children && Array.isArray(node.children)) {
+        node.children.forEach(child => traverseAndTransformObjects(child));
+    }
+
+    // 检查当前节点是否是需要转换的 <object> 标签
+    if (node.tagName === 'object') {
+        console.log("发现一个 <object> 标签，正在转换为 ActiveXPlaceholder...");
+
+        // 1. 提取所有 <param> 标签的 name 和 value
+        const params = {};
+        if (node.children && Array.isArray(node.children)) {
+            node.children.forEach(child => {
+                // 确保子节点是 <param> 并且有 attributes
+                if (child.tagName === 'param' && child.attributes) {
+                    const name = child.attributes.name;
+                    const value = child.attributes.value;
+                    if (name) { // 只有当 name 属性存在时才添加
+                        params[name] = value || ""; // 如果 value 不存在，则设置为空字符串
+                    }
+                }
+            });
+        }
+
+        // 2. 修改当前节点
+        node.tagName = 'ActiveXPlaceholder'; // 修改 tagName
+        node.isComponent = true;              // 标记为组件
+
+        // 3. 用提取出的参数替换原来的 children
+        // 这样可以清除掉原始的 <param> 节点，只保留关键信息
+        node.children = [
+            {
+                // 我们将参数包裹在一个对象中，以保持结构清晰
+                "params": params
+            }
+        ];
+    }
+}
+
 
 /**
  * 确保从LLM获取的内容是有效的JSON，如果不是则要求LLM重新生成，最多重试3次。
@@ -80,6 +137,9 @@ async function generateAndValidateJson(sessionId, initialContent) {
             let parsedJson = JSON.parse(currentContent);
             console.log(`Attempt ${attempt}: JSON is valid.`);
             traverseAndFixTables(parsedJson.elements);
+            // 运行第二个后处理函数：转换 <object> 标签
+            console.log("开始扫描并转换 <object> 标签...");
+            traverseAndTransformObjects(parsedJson.elements);
             return JSON.stringify(parsedJson, null, 2); // 成功，返回格式化后的JSON
         } catch (error) {
             console.error(`Attempt ${attempt}/${maxAttempts} failed: Content is not valid JSON.`);
