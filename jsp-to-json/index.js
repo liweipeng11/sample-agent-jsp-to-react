@@ -33,53 +33,36 @@ function traverseAndTransformObjects(node) {
     }
 
     if (Array.isArray(node)) {
-        // 如果是数组，则遍历数组中的每个元素
         node.forEach(item => traverseAndTransformObjects(item));
         return;
     }
 
-    // 在处理当前节点之前，先递归处理其子节点
     if (node.children && Array.isArray(node.children)) {
         node.children.forEach(child => traverseAndTransformObjects(child));
     }
 
-    // 检查当前节点是否是需要转换的 <object> 标签
     if (node.tagName === 'object') {
         console.log("发现一个 <object> 标签，正在转换为 ActiveXPlaceholder...");
-
-        // 1. 提取所有 <param> 标签的 name 和 value
         const params = {};
         if (node.children && Array.isArray(node.children)) {
             node.children.forEach(child => {
-                // 确保子节点是 <param> 并且有 attributes
                 if (child.tagName === 'param' && child.attributes) {
                     const name = child.attributes.name;
                     const value = child.attributes.value;
-                    if (name) { // 只有当 name 属性存在时才添加
-                        params[name] = value || ""; // 如果 value 不存在，则设置为空字符串
+                    if (name) {
+                        params[name] = value || "";
                     }
                 }
             });
         }
-
-        // 2. 修改当前节点
-        node.tagName = 'ActiveXPlaceholder'; // 修改 tagName
-        node.isComponent = true;              // 标记为组件
-
-        // 3. 用提取出的参数替换原来的 children
-        // 这样可以清除掉原始的 <param> 节点，只保留关键信息
-        node.children = [
-            {
-                // 我们将参数包裹在一个对象中，以保持结构清晰
-                "params": params
-            }
-        ];
+        node.tagName = 'ActiveXPlaceholder';
+        node.isComponent = true;
+        node.children = [{ "params": params }];
     }
 }
 
 /**
  * 辅助函数：将CSS字符串解析为CSS-in-JS对象。
- * 例如 "color: red; font-size: 12px" -> { color: "red", fontSize: "12px" }
  * @param {string} cssText - CSS样式字符串。
  * @returns {object} - CSS-in-JS格式的样式对象。
  */
@@ -100,129 +83,200 @@ function parseCssStringToObject(cssText) {
     return style;
 }
 
+// --- (新增) 属性到样式的转换 ---
 
 /**
- * (最终合并) 递归地遍历JSON树，对表格相关元素进行一次性、全面的处理和修复。
- * 1. 对于 <table>: 
- *    - 检查并自动包裹缺少 <tbody> 的子元素。
- *    - 将 cellspacing 和 cellpadding 属性转换为 CSS-in-JS 格式的 style 对象，并智能合并。
- * 2. 对于 <tr>: 
- *    - 检查其直接子元素，如果子元素不是 <td> 或 <th>，则自动用一个隐藏的 <td> 将其包裹。
- * @param {any} node - JSON树中的当前节点（对象或数组）。
+ * 辅助函数：如果值是纯数字，则为其添加 'px' 单位。
+ * @param {string} value - 属性值。
+ * @returns {string} - 处理后的值。
  */
-function traverseAndProcessAllTableLogic(node) {
+const addPxIfNeeded = (value) => {
+    if (String(value).match(/^[0-9]+$/)) {
+        return `${value}px`;
+    }
+    return value;
+};
+
+/**
+ * 定义一个从废弃的HTML属性到CSS-in-JS样式的映射。
+ * 每个键是HTML属性名，值是一个描述如何转换的对象。
+ * - cssProperty: 对应的CSS属性名。
+ * - valueMap: (可选) 用于直接映射特定值的对象。
+ * - handler: (可选) 一个自定义函数，用于更复杂的转换逻辑。
+ */
+const attributeToStyleMap = {
+    'align': { cssProperty: 'textAlign' },
+    'valign': { cssProperty: 'verticalAlign' },
+    'bgcolor': { cssProperty: 'backgroundColor' },
+    'background': { cssProperty: 'backgroundImage', handler: (value) => `url(${value})` },
+    'width': { cssProperty: 'width', handler: addPxIfNeeded },
+    'height': { cssProperty: 'height', handler: addPxIfNeeded },
+    'border': {
+        cssProperty: 'border',
+        handler: (value) => (value === '0' ? 'none' : `${addPxIfNeeded(value)} solid black`)
+    },
+    'nowrap': { cssProperty: 'whiteSpace', fixedValue: 'nowrap' },
+    'cellspacing': {
+        handler: (value, style) => {
+            style.borderSpacing = addPxIfNeeded(value);
+            style.borderCollapse = 'separate';
+        }
+    },
+    // color、face、size 属性常用于 <font> 标签，但也可以在此处通用处理
+    'color': { cssProperty: 'color' },
+    'face': { cssProperty: 'fontFamily' },
+    'size': { cssProperty: 'fontSize', handler: addPxIfNeeded } // 简单处理，实际的 size 映射更复杂
+};
+
+/**
+ * (新) 递归遍历JSON树，将所有废弃的展示性属性转换为CSS-in-JS的 style 对象。
+ * @param {any} node - JSON树中的当前节点。
+ */
+function traverseAndApplyPresentationalAttributes(node) {
     if (node === null || typeof node !== 'object') {
         return;
     }
 
     if (Array.isArray(node)) {
-        node.forEach(item => traverseAndProcessAllTableLogic(item));
+        node.forEach(item => traverseAndApplyPresentationalAttributes(item));
         return;
     }
 
-    // --- 1. 针对 <table> 节点的所有处理逻辑 ---
-    if (node.tagName === 'table') {
-        // --- 1a. 修复缺失的 <tbody> ---
-        const hasChildren = node.children && Array.isArray(node.children) && node.children.length > 0;
-        if (hasChildren) {
-            const needsTbody = node.children[0].tagName !== 'tbody';
-            if (needsTbody) {
-                console.log("发现一个 <table> 缺少 <tbody>，正在包裹其子元素...");
-                const originalChildren = node.children;
-                const tbodyElement = {
-                    tagName: 'tbody',
-                    children: originalChildren
-                };
-                node.children = [tbodyElement];
+    if (node.attributes) {
+        let styleObject = {};
+        // 确保与现有的 style 属性合并
+        if (node.attributes.style) {
+            if (typeof node.attributes.style === 'string') {
+                styleObject = parseCssStringToObject(node.attributes.style);
+            } else if (typeof node.attributes.style === 'object') {
+                styleObject = { ...node.attributes.style };
             }
         }
 
-        // --- 1b. 处理 cellspacing 和 cellpadding ---
-        if (node.attributes) {
-            const attributes = node.attributes;
-            let styleObject = {};
+        const attributesToDelete = [];
 
-            if (attributes.style) {
-                if (typeof attributes.style === 'string') {
-                    styleObject = parseCssStringToObject(attributes.style);
-                } else if (typeof attributes.style === 'object') {
-                    styleObject = { ...attributes.style };
-                }
-            }
+        for (const attrName in node.attributes) {
+            if (attributeToStyleMap[attrName]) {
+                const mapping = attributeToStyleMap[attrName];
+                const attrValue = node.attributes[attrName];
 
-            if (attributes.cellspacing) {
-                console.log(`发现 cellspacing="${attributes.cellspacing}"，转换为 style 对象...`);
-                styleObject.borderSpacing = `${attributes.cellspacing}px`;
-                styleObject.borderCollapse = 'separate';
-                delete attributes.cellspacing;
-            }
+                console.log(`发现属性 ${attrName}="${attrValue}"，正在转换为 style...`);
 
-            if (attributes.cellpadding) {
-                console.log(`发现 cellpadding="${attributes.cellpadding}"，转换为子元素 td/th 的 style...`);
-                const paddingValue = `${attributes.cellpadding}px`;
-
-                const applyPaddingToCells = (currentNode) => {
-                    if (!currentNode) return;
-                    if (Array.isArray(currentNode)) {
-                        currentNode.forEach(applyPaddingToCells);
-                    } else if (typeof currentNode === 'object') {
-                        if (currentNode.tagName === 'td' || currentNode.tagName === 'th') {
-                            if (!currentNode.attributes) currentNode.attributes = {};
-                            
-                            let cellStyleObject = {};
-                            if (currentNode.attributes.style && typeof currentNode.attributes.style === 'string') {
-                                cellStyleObject = parseCssStringToObject(currentNode.attributes.style);
-                            } else if (currentNode.attributes.style && typeof currentNode.attributes.style === 'object') {
-                                cellStyleObject = { ...currentNode.attributes.style };
-                            }
-                            
-                            cellStyleObject.padding = paddingValue;
-                            currentNode.attributes.style = cellStyleObject;
-                        }
-                        if (currentNode.children) {
-                            applyPaddingToCells(currentNode.children);
-                        }
+                if (mapping.handler) {
+                    // 自定义处理器可能直接修改 styleObject
+                    mapping.handler(attrValue, styleObject);
+                } else {
+                    let finalValue = attrValue;
+                    if (mapping.fixedValue) {
+                        finalValue = mapping.fixedValue;
+                    } else if (mapping.valueMap && mapping.valueMap[attrValue]) {
+                        finalValue = mapping.valueMap[attrValue];
                     }
-                };
-
-                if (node.children) {
-                    applyPaddingToCells(node.children);
+                    styleObject[mapping.cssProperty] = finalValue;
                 }
-                delete attributes.cellpadding;
-            }
 
-            if (Object.keys(styleObject).length > 0) {
-                attributes.style = styleObject;
-            } else {
-                delete attributes.style;
+                attributesToDelete.push(attrName);
             }
+        }
+
+        // 清理已转换的属性
+        attributesToDelete.forEach(attr => delete node.attributes[attr]);
+
+        // 更新 style 属性
+        if (Object.keys(styleObject).length > 0) {
+            node.attributes.style = styleObject;
+        } else {
+            // 如果 style 对象为空，则移除它
+            delete node.attributes.style;
         }
     }
 
-    // --- 2. 针对 <tr> 节点的处理逻辑 ---
-    else if (node.tagName === 'tr' && node.children && Array.isArray(node.children)) {
-        const newChildren = [];
-        node.children.forEach(child => {
-            const isInvalidChild = !(child && typeof child === 'object' && (child.tagName === 'td' || child.tagName === 'th'));
-            
-            if (isInvalidChild) {
+    if (node.children && Array.isArray(node.children)) {
+        node.children.forEach(child => traverseAndApplyPresentationalAttributes(child));
+    }
+}
+
+
+/**
+ * (已重构) 递归地遍历JSON树，仅处理表格的 *结构性* 问题。
+ * 1. 对于 <table>: 
+ *    - 检查并自动包裹缺少 <tbody> 的子元素。
+ *    - 将 cellpadding 属性转换为其子单元格的 padding 样式。
+ * 2. 对于 <tr>: 
+ *    - 检查其直接子元素，如果不是 <td> 或 <th>，则用隐藏的 <td> 包裹。
+ * @param {any} node - JSON树中的当前节点。
+ */
+function traverseAndProcessTableStructure(node) {
+    if (node === null || typeof node !== 'object') {
+        return;
+    }
+
+    if (Array.isArray(node)) {
+        node.forEach(item => traverseAndProcessTableStructure(item));
+        return;
+    }
+
+    if (node.tagName === 'table') {
+        // 1a. 修复缺失的 <tbody>
+        const hasChildren = node.children && Array.isArray(node.children) && node.children.length > 0;
+        if (hasChildren && node.children[0].tagName !== 'tbody') {
+            console.log("发现一个 <table> 缺少 <tbody>，正在包裹其子元素...");
+            const tbodyElement = { tagName: 'tbody', children: node.children };
+            node.children = [tbodyElement];
+        }
+
+        // 1b. 处理 cellpadding (因为它影响子元素，所以留在这里)
+        if (node.attributes && node.attributes.cellpadding) {
+            console.log(`发现 cellpadding="${node.attributes.cellpadding}"，转换为子元素 td/th 的 style...`);
+            const paddingValue = addPxIfNeeded(node.attributes.cellpadding);
+
+            const applyPaddingToCells = (currentNode) => {
+                if (!currentNode) return;
+                if (Array.isArray(currentNode)) {
+                    currentNode.forEach(applyPaddingToCells);
+                } else if (typeof currentNode === 'object') {
+                    if (currentNode.tagName === 'td' || currentNode.tagName === 'th') {
+                        if (!currentNode.attributes) currentNode.attributes = {};
+
+                        let cellStyle = {};
+                        if (currentNode.attributes.style && typeof currentNode.attributes.style === 'string') {
+                            cellStyle = parseCssStringToObject(currentNode.attributes.style);
+                        } else if (currentNode.attributes.style && typeof currentNode.attributes.style === 'object') {
+                            cellStyle = { ...currentNode.attributes.style };
+                        }
+
+                        cellStyle.padding = paddingValue;
+                        currentNode.attributes.style = cellStyle;
+                    }
+                    if (currentNode.children) {
+                        applyPaddingToCells(currentNode.children);
+                    }
+                }
+            };
+
+            if (node.children) {
+                applyPaddingToCells(node.children);
+            }
+            delete node.attributes.cellpadding;
+        }
+    } else if (node.tagName === 'tr' && node.children && Array.isArray(node.children)) {
+        // 2. 修复 <tr> 的无效子元素
+        node.children = node.children.map(child => {
+            const isInvalid = !(child && typeof child === 'object' && (child.tagName === 'td' || child.tagName === 'th'));
+            if (isInvalid) {
                 console.log("在 <tr> 中发现无效的子元素，正在用隐藏的 <td> 包裹...");
-                const wrapperTd = {
+                return {
                     tagName: 'td',
                     attributes: { style: { display: 'none' } },
                     children: [child]
                 };
-                newChildren.push(wrapperTd);
-            } else {
-                newChildren.push(child);
             }
+            return child;
         });
-        node.children = newChildren;
     }
 
-    // --- 3. 对所有子节点进行递归调用 ---
     if (node.children && Array.isArray(node.children)) {
-        node.children.forEach(child => traverseAndProcessAllTableLogic(child));
+        node.children.forEach(child => traverseAndProcessTableStructure(child));
     }
 }
 
@@ -245,7 +299,7 @@ function traverseAndReplaceSessionGetAttribute(node) {
     if (typeof node.condition === 'string' && node.condition.includes('session.getAttribute')) {
         console.log(`发现 condition 字段: "${node.condition}"，正在转换...`);
         const regex = /session\.getAttribute\((.*?)\)/g;
-        
+
         node.condition = node.condition.replace(regex, (match, capturedArg) => {
             let key = capturedArg.trim();
             if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
@@ -271,31 +325,111 @@ function traverseAndReplaceSessionGetAttribute(node) {
  * @returns {Array} - 处理后生成的新元素数组。
  */
 function processJsonElements(elements) {
-  if (!Array.isArray(elements)) return [];
+    if (!Array.isArray(elements)) return [];
 
-  return elements.reduce((accumulator, currentElement) => {
-    const tagsToRemove = ['meta', 'title', 'link', 'script', 'noscript','style'];
-    if (tagsToRemove.includes(currentElement.tagName)) {
-      return accumulator;
-    }
+    return elements.reduce((accumulator, currentElement) => {
+        const tagsToRemove = ['meta', 'title', 'link', 'script', 'noscript', 'style'];
+        if (tagsToRemove.includes(currentElement.tagName)) {
+            return accumulator;
+        }
 
-    const tagsToUnwrap = ['html', 'head', 'body'];
-    if (tagsToUnwrap.includes(currentElement.tagName)) {
-      const children = currentElement.children || [];
-      return accumulator.concat(processJsonElements(children));
-    }
-    
-    if (currentElement.children && currentElement.children.length > 0) {
-      const newElement = { ...currentElement };
-      newElement.children = processJsonElements(currentElement.children);
-      accumulator.push(newElement);
-    } else {
-      accumulator.push(currentElement);
-    }
+        const tagsToUnwrap = ['html', 'head', 'body'];
+        if (tagsToUnwrap.includes(currentElement.tagName)) {
+            const children = currentElement.children || [];
+            return accumulator.concat(processJsonElements(children));
+        }
 
-    return accumulator;
-  }, []);
+        if (currentElement.children && currentElement.children.length > 0) {
+            const newElement = { ...currentElement };
+            newElement.children = processJsonElements(currentElement.children);
+            accumulator.push(newElement);
+        } else {
+            accumulator.push(currentElement);
+        }
+
+        return accumulator;
+    }, []);
 }
+
+// --- 配置化规则表 ---
+const nestingRules = [
+    {
+        match: (node, parent) => parent?.tagName === 'tr' && node.tagName === 'form',
+        fix: (node, parent) => {
+            console.log("修复: <tr> 下直接有 <form>");
+            const wrapperTd = { tagName: 'td', attributes: {}, children: [node] };
+            const idx = parent.children.indexOf(node);
+            parent.children[idx] = wrapperTd;
+        }
+    },
+    {
+        match: (node, parent) => parent?.tagName === 'p' && node.tagName === 'form',
+        fix: (node, parent) => {
+            console.log("修复: <p> 下直接有 <form>");
+            if (parent.parent) {
+                const parentIndex = parent.parent.children.indexOf(parent);
+                parent.parent.children.splice(parentIndex, 0, node);
+                parent.children = parent.children.filter(c => c !== node);
+            }
+        }
+    },
+    {
+        match: (node, parent) => parent?.tagName === 'table' && node.tagName === 'form',
+        fix: (node, parent) => {
+            console.log("修复: <table> 下直接有 <form>");
+            if (parent.parent) {
+                const idx = parent.parent.children.indexOf(parent);
+                parent.parent.children[idx] = {
+                    tagName: 'form',
+                    attributes: {},
+                    children: [parent]
+                };
+            }
+        }
+    },
+    {
+        match: (node, parent) => node.tagName === 'td' && (!parent || parent?.tagName !== 'tr'),
+        fix: (node, parent, rootRef) => {
+            console.log("修复: 孤立 <td>");
+            const wrapperTr = { tagName: 'tr', attributes: {}, children: [node] };
+            const wrapperTable = { tagName: 'table', attributes: {}, children: [wrapperTr] };
+            if (parent) {
+                const idx = parent.children.indexOf(node);
+                parent.children[idx] = wrapperTable;
+            } else {
+                // parent 为 null，说明 node 在根级
+                if (Array.isArray(rootRef.elements)) {
+                    const idx = rootRef.elements.indexOf(node);
+                    if (idx !== -1) {
+                        rootRef.elements[idx] = wrapperTable;
+                    }
+                }
+            }
+        }
+    }
+
+];
+
+
+// --- 统一的修复器 ---
+function traverseAndFixInvalidNesting(node, parent = null, rootRef = null) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    node.forEach(child => traverseAndFixInvalidNesting(child, parent, rootRef));
+    return;
+  }
+
+  for (const rule of nestingRules) {
+    if (rule.match(node, parent)) {
+      rule.fix(node, parent, rootRef);
+    }
+  }
+
+  if (node.children && Array.isArray(node.children)) {
+    node.children.forEach(child => traverseAndFixInvalidNesting(child, node, rootRef));
+  }
+}
+
 
 
 /**
@@ -315,18 +449,21 @@ async function generateAndValidateJson(sessionId, initialContent) {
 
             // --- 运行所有的后处理函数 ---
 
-            // 1. 处理 <object> 标签
+            // 1. (新) 通用处理：将所有废弃的展示性属性转换为 style 对象
+            traverseAndApplyPresentationalAttributes(parsedJson.elements);
+
+            // 2. 特殊处理 <object> 标签
             traverseAndTransformObjects(parsedJson.elements);
-            
-            // 2. 处理 session.getAttribute
+
+            // 3. 特殊处理 session.getAttribute
             traverseAndReplaceSessionGetAttribute(parsedJson.elements);
 
-            // 3. (新) 对所有表格问题进行一次性、全面的修复
-            console.log("正在对表格进行 tbody、样式和 tr 结构的全面修复...");
-            traverseAndProcessAllTableLogic(parsedJson.elements);
-            
-            // 4. (最终) 应用节点过滤和结构扁平化规则
-            console.log("正在应用最终的节点过滤和结构扁平化规则...");
+            // 4. (重构) 仅处理表格的 *结构性* 问题
+            traverseAndProcessTableStructure(parsedJson.elements);
+
+            // 新增步骤: 修复不规范嵌套
+            traverseAndFixInvalidNesting(parsedJson.elements, null, parsedJson);
+            // 5. (最终) 应用节点过滤和结构扁平化规则
             parsedJson.elements = processJsonElements(parsedJson.elements);
 
             return JSON.stringify(parsedJson, null, 2); // 成功

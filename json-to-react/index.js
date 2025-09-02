@@ -13,17 +13,19 @@ import {
 // 创建路由实例
 const router = express.Router();
 
+const fileType = "tsx"
+
 // 系统提示 (保持不变)
-const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于将结构化的JSON中间表示（IR）精确地转换为高效、可维护的React JSX代码。
-根据提供的JSON数据生成React组件(JSX格式)，严格遵循以下规则：
+const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于将结构化的JSON中间表示（IR）精确地转换为高效、可维护的React ${fileType.toUpperCase()}代码。
+根据提供的JSON数据生成React组件(${fileType.toUpperCase()}格式)，严格遵循以下规则：
 1. 输出要保证是一个合法的React组件结构，并使用export default 导出
 2. HTML标准标签必须使用完整闭合语法（如<div></div>）
 3. 变量使用useState声明，禁止使用useEffect初始化
 4. 事件处理函数只需定义名称，内容统一用console.log()实现
 5. isComponent为true时为组件引用，componentUrl为组件地址
 6. 正确解析<%...%>中的变量和条件表达式
-7. 最终输出必须是完整的JSX文件内容
-8. 最终输出必须是一个有效的、经过清理的jsx代码，不包含任何解释、注释或Markdown代码块。
+7. 最终输出必须是完整的${fileType.toUpperCase()}文件内容
+8. 最终输出必须是一个有效的、经过清理的${fileType}代码，不包含任何解释、注释或Markdown代码块。
 9. 当处理tagName为'RouteOutlet'的节点或收到来自'handleRouteOutlet'工具的结果时，你必须:
     a. 在文件顶部导入 'useNavigate' hook: import { useNavigate } from 'react-router-dom';
     b. 在组件函数顶部初始化hook: const navigate = useNavigate();
@@ -34,7 +36,7 @@ const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于�
     c. 在 <div> 内部，必须包含一个醒目的H3标题，内容为 "TODO: 替换遗留ActiveX控件"。
     d. 在标题下方，必须使用 <pre><code> 标签，将从工具结果的 'props' 字段接收到的所有属性和参数，格式化为JSON字符串并完整显示出来。
     e. 在组件文件的顶部，必须添加一个详细的多行注释，解释这个占位符的来源、风险以及需要开发人员采取的行动。
-请提供需要转换的JSON数据，我将严格按照上述规则生成对应的React JSX组件代码。`;
+请提供需要转换的JSON数据，我将严格按照上述规则生成对应的React ${fileType.toUpperCase()}组件代码。`;
 
 // --- React专用的工具处理函数 --- (保持不变)
 async function handleReactToolCalls(toolCalls, sessionId) {
@@ -104,11 +106,11 @@ async function validateJsxSyntax(code) {
     try {
         parse(code, {
             sourceType: 'module',
-            plugins: ['jsx'],
+            plugins: fileType === 'jsx' ? ['jsx'] : ['typescript','jsx'],
         });
     } catch (error) {
-        console.error("JSX语法验证失败:", error.message);
-        const syntaxError = new Error(`JSX语法无效: ${error.message}`);
+        console.error(`${fileType.toUpperCase()}语法验证失败:`, error.message);
+        const syntaxError = new Error(`${fileType.toUpperCase()}语法无效: ${error.message}`);
         syntaxError.code = code;
         throw syntaxError;
     }
@@ -121,7 +123,7 @@ async function fixUndeclaredVariables(code) {
 关键规则：初始化时，必须同时声明变量本身及其对应的setter函数。
 例如：如果发现变量 'userName' 未声明，你应该添加 'const [userName, setUserName] = useState(undefined);'。
 不要修改任何已有的代码逻辑，只在顶部添加必要的 'useState' 声明。
-最终只返回完整的、修复后的JSX代码，不包含任何解释或Markdown。
+最终只返回完整的、修复后的${fileType.toUpperCase()}代码，不包含任何解释或Markdown。
 特殊情况：
 1.sessionStorage.getItem('someKey') 会被视为合法用法，无需修复。`;
 
@@ -144,6 +146,39 @@ async function fixUndeclaredVariables(code) {
         console.error("使用大模型修复变量时出错:", error);
         throw new Error("使用大模型修复变量时失败。");
     }
+}
+
+
+// <<< 新增：语法转换字典 >>>
+/**
+ * 语法转换字典.
+ * 键是用于匹配的正则表达式.
+ * 值是替换字符串或一个函数，用于动态替换.
+ * 'g' 标志用于全局替换.
+ */
+const syntaxDictionary = {
+    // 转换 .isEmpty() 为 !== ""
+    "\\.isEmpty\\(\\)": '!== ""',
+};
+
+// <<< 新增：应用语法转换的函数 >>>
+/**
+ * 根据语法字典转换代码.
+ * @param {string} code - 需要转换的代码.
+ * @returns {string} - 转换后的代码.
+ */
+function applySyntaxTransformations(code) {
+    let transformedCode = code;
+    for (const pattern in syntaxDictionary) {
+        const replacement = syntaxDictionary[pattern];
+        try {
+            const regex = new RegExp(pattern, 'g');
+            transformedCode = transformedCode.replace(regex, replacement);
+        } catch (error) {
+            console.error(`应用语法转换时出错: ${error.message}`);
+        }
+    }
+    return transformedCode;
 }
 
 
@@ -233,7 +268,7 @@ router.post('/generate-react', async (req, res) => {
             await handleReactToolCalls(toolCallsToProcess, sessionId);
         }
 
-        // --- 统一的代码生成、验证与修复循环 (保持不变) ---
+        // --- 统一的代码生成、验证与修复循环 (已更新) ---
         let finalReactCode = "";
         let isCodeValid = false;
         let attempts = 0;
@@ -263,7 +298,11 @@ router.post('/generate-react', async (req, res) => {
                 if (!generatedCode) throw new Error("模型生成了空代码。");
                 
                 await validateJsxSyntax(generatedCode);
-                finalReactCode = await fixUndeclaredVariables(generatedCode);
+                let fixedCode = await fixUndeclaredVariables(generatedCode);
+                
+                // <<< 新增：在最终验证前应用语法转换 >>>
+                finalReactCode = applySyntaxTransformations(fixedCode);
+                
                 isCodeValid = true;
 
             } catch (error) {
