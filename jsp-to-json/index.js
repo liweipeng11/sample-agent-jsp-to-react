@@ -22,50 +22,6 @@ const __dirname = path.dirname(__filename);
 
 /**
  * 递归地遍历一个代表HTML树的JSON对象。
- * 如果找到一个'table'标签，其直接子元素没有被'tbody'包裹，
- * 该函数会创建一个'tbody'元素并将所有子元素移入其中。
- * 此函数现在使用 'tagName' 属性，以匹配您提供的JSON格式。
- * @param {any} node - JSON树中的当前节点（对象或数组）。
- */
-function traverseAndFixTables(node) {
-    if (node === null || typeof node !== 'object') {
-        return;
-    }
-
-    if (Array.isArray(node)) {
-        node.forEach(item => traverseAndFixTables(item));
-        return;
-    }
-
-    // 首先，递归处理子节点
-    if (node.children && Array.isArray(node.children)) {
-        node.children.forEach(child => traverseAndFixTables(child));
-    }
-
-    // 检查当前节点是否是需要修复的table
-    const isTable = node.tagName === 'table';
-    const hasChildren = node.children && Array.isArray(node.children) && node.children.length > 0;
-
-    if (isTable && hasChildren) {
-        // 如果第一个子节点不是tbody，我们就需要包裹它们
-        const needsTbody = node.children[0].tagName !== 'tbody';
-
-        if (needsTbody) {
-            console.log("发现一个 <table> 缺少 <tbody>，正在包裹其子元素...");
-            const originalChildren = node.children;
-            // 创建新的tbody元素，使用 'tagName'
-            const tbodyElement = {
-                tagName: 'tbody',
-                children: originalChildren
-            };
-            // 用只包含新tbody的数组替换table的子元素
-            node.children = [tbodyElement];
-        }
-    }
-}
-
-/**
- * 递归地遍历一个代表HTML树的JSON对象。
  * 如果找到一个'object'标签（通常用于ActiveX），
  * 它会将其转换为一个 "ActiveXPlaceholder" 组件，
  * 并将所有 <param> 子标签的信息提取到一个 params 对象中。
@@ -121,6 +77,226 @@ function traverseAndTransformObjects(node) {
     }
 }
 
+/**
+ * 辅助函数：将CSS字符串解析为CSS-in-JS对象。
+ * 例如 "color: red; font-size: 12px" -> { color: "red", fontSize: "12px" }
+ * @param {string} cssText - CSS样式字符串。
+ * @returns {object} - CSS-in-JS格式的样式对象。
+ */
+function parseCssStringToObject(cssText) {
+    if (typeof cssText !== 'string' || !cssText) {
+        return {};
+    }
+    const style = {};
+    cssText.split(';').forEach(declaration => {
+        if (declaration.trim()) {
+            const [property, value] = declaration.split(':');
+            if (property && value) {
+                const camelCaseProperty = property.trim().replace(/-(\w)/g, (_, letter) => letter.toUpperCase());
+                style[camelCaseProperty] = value.trim();
+            }
+        }
+    });
+    return style;
+}
+
+
+/**
+ * (最终合并) 递归地遍历JSON树，对表格相关元素进行一次性、全面的处理和修复。
+ * 1. 对于 <table>: 
+ *    - 检查并自动包裹缺少 <tbody> 的子元素。
+ *    - 将 cellspacing 和 cellpadding 属性转换为 CSS-in-JS 格式的 style 对象，并智能合并。
+ * 2. 对于 <tr>: 
+ *    - 检查其直接子元素，如果子元素不是 <td> 或 <th>，则自动用一个隐藏的 <td> 将其包裹。
+ * @param {any} node - JSON树中的当前节点（对象或数组）。
+ */
+function traverseAndProcessAllTableLogic(node) {
+    if (node === null || typeof node !== 'object') {
+        return;
+    }
+
+    if (Array.isArray(node)) {
+        node.forEach(item => traverseAndProcessAllTableLogic(item));
+        return;
+    }
+
+    // --- 1. 针对 <table> 节点的所有处理逻辑 ---
+    if (node.tagName === 'table') {
+        // --- 1a. 修复缺失的 <tbody> ---
+        const hasChildren = node.children && Array.isArray(node.children) && node.children.length > 0;
+        if (hasChildren) {
+            const needsTbody = node.children[0].tagName !== 'tbody';
+            if (needsTbody) {
+                console.log("发现一个 <table> 缺少 <tbody>，正在包裹其子元素...");
+                const originalChildren = node.children;
+                const tbodyElement = {
+                    tagName: 'tbody',
+                    children: originalChildren
+                };
+                node.children = [tbodyElement];
+            }
+        }
+
+        // --- 1b. 处理 cellspacing 和 cellpadding ---
+        if (node.attributes) {
+            const attributes = node.attributes;
+            let styleObject = {};
+
+            if (attributes.style) {
+                if (typeof attributes.style === 'string') {
+                    styleObject = parseCssStringToObject(attributes.style);
+                } else if (typeof attributes.style === 'object') {
+                    styleObject = { ...attributes.style };
+                }
+            }
+
+            if (attributes.cellspacing) {
+                console.log(`发现 cellspacing="${attributes.cellspacing}"，转换为 style 对象...`);
+                styleObject.borderSpacing = `${attributes.cellspacing}px`;
+                styleObject.borderCollapse = 'separate';
+                delete attributes.cellspacing;
+            }
+
+            if (attributes.cellpadding) {
+                console.log(`发现 cellpadding="${attributes.cellpadding}"，转换为子元素 td/th 的 style...`);
+                const paddingValue = `${attributes.cellpadding}px`;
+
+                const applyPaddingToCells = (currentNode) => {
+                    if (!currentNode) return;
+                    if (Array.isArray(currentNode)) {
+                        currentNode.forEach(applyPaddingToCells);
+                    } else if (typeof currentNode === 'object') {
+                        if (currentNode.tagName === 'td' || currentNode.tagName === 'th') {
+                            if (!currentNode.attributes) currentNode.attributes = {};
+                            
+                            let cellStyleObject = {};
+                            if (currentNode.attributes.style && typeof currentNode.attributes.style === 'string') {
+                                cellStyleObject = parseCssStringToObject(currentNode.attributes.style);
+                            } else if (currentNode.attributes.style && typeof currentNode.attributes.style === 'object') {
+                                cellStyleObject = { ...currentNode.attributes.style };
+                            }
+                            
+                            cellStyleObject.padding = paddingValue;
+                            currentNode.attributes.style = cellStyleObject;
+                        }
+                        if (currentNode.children) {
+                            applyPaddingToCells(currentNode.children);
+                        }
+                    }
+                };
+
+                if (node.children) {
+                    applyPaddingToCells(node.children);
+                }
+                delete attributes.cellpadding;
+            }
+
+            if (Object.keys(styleObject).length > 0) {
+                attributes.style = styleObject;
+            } else {
+                delete attributes.style;
+            }
+        }
+    }
+
+    // --- 2. 针对 <tr> 节点的处理逻辑 ---
+    else if (node.tagName === 'tr' && node.children && Array.isArray(node.children)) {
+        const newChildren = [];
+        node.children.forEach(child => {
+            const isInvalidChild = !(child && typeof child === 'object' && (child.tagName === 'td' || child.tagName === 'th'));
+            
+            if (isInvalidChild) {
+                console.log("在 <tr> 中发现无效的子元素，正在用隐藏的 <td> 包裹...");
+                const wrapperTd = {
+                    tagName: 'td',
+                    attributes: { style: { display: 'none' } },
+                    children: [child]
+                };
+                newChildren.push(wrapperTd);
+            } else {
+                newChildren.push(child);
+            }
+        });
+        node.children = newChildren;
+    }
+
+    // --- 3. 对所有子节点进行递归调用 ---
+    if (node.children && Array.isArray(node.children)) {
+        node.children.forEach(child => traverseAndProcessAllTableLogic(child));
+    }
+}
+
+
+/**
+ * 递归地遍历JSON树，将 'condition' 字段中的 'session.getAttribute(KEY)'
+ * 智能地替换为 'sessionStorage.getItem('KEY')'。
+ * @param {any} node - JSON树中的当前节点（对象或数组）。
+ */
+function traverseAndReplaceSessionGetAttribute(node) {
+    if (node === null || typeof node !== 'object') {
+        return;
+    }
+
+    if (Array.isArray(node)) {
+        node.forEach(item => traverseAndReplaceSessionGetAttribute(item));
+        return;
+    }
+
+    if (typeof node.condition === 'string' && node.condition.includes('session.getAttribute')) {
+        console.log(`发现 condition 字段: "${node.condition}"，正在转换...`);
+        const regex = /session\.getAttribute\((.*?)\)/g;
+        
+        node.condition = node.condition.replace(regex, (match, capturedArg) => {
+            let key = capturedArg.trim();
+            if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+                key = key.substring(1, key.length - 1);
+            }
+            return `sessionStorage.getItem('${key}')`;
+        });
+
+        console.log(`转换后: "${node.condition}"`);
+    }
+
+    if (node.children && Array.isArray(node.children)) {
+        node.children.forEach(child => traverseAndReplaceSessionGetAttribute(child));
+    }
+}
+
+/**
+ * 根据指定规则递归处理 JSON 元素数组。
+ * 1. 移除 tagName 为 'meta', 'title', 'link', 'script', 'noscript', 'style' 的节点。
+ * 2. 对于 tagName 为 'html', 'head', 'body' 的节点，不包含节点本身，而是直接处理其 children。
+ * 3. 递归处理所有子节点。
+ * @param {Array} elements - 需要处理的元素节点数组。
+ * @returns {Array} - 处理后生成的新元素数组。
+ */
+function processJsonElements(elements) {
+  if (!Array.isArray(elements)) return [];
+
+  return elements.reduce((accumulator, currentElement) => {
+    const tagsToRemove = ['meta', 'title', 'link', 'script', 'noscript','style'];
+    if (tagsToRemove.includes(currentElement.tagName)) {
+      return accumulator;
+    }
+
+    const tagsToUnwrap = ['html', 'head', 'body'];
+    if (tagsToUnwrap.includes(currentElement.tagName)) {
+      const children = currentElement.children || [];
+      return accumulator.concat(processJsonElements(children));
+    }
+    
+    if (currentElement.children && currentElement.children.length > 0) {
+      const newElement = { ...currentElement };
+      newElement.children = processJsonElements(currentElement.children);
+      accumulator.push(newElement);
+    } else {
+      accumulator.push(currentElement);
+    }
+
+    return accumulator;
+  }, []);
+}
+
 
 /**
  * 确保从LLM获取的内容是有效的JSON，如果不是则要求LLM重新生成，最多重试3次。
@@ -136,11 +312,25 @@ async function generateAndValidateJson(sessionId, initialContent) {
         try {
             let parsedJson = JSON.parse(currentContent);
             console.log(`Attempt ${attempt}: JSON is valid.`);
-            traverseAndFixTables(parsedJson.elements);
-            // 运行第二个后处理函数：转换 <object> 标签
-            console.log("开始扫描并转换 <object> 标签...");
+
+            // --- 运行所有的后处理函数 ---
+
+            // 1. 处理 <object> 标签
             traverseAndTransformObjects(parsedJson.elements);
-            return JSON.stringify(parsedJson, null, 2); // 成功，返回格式化后的JSON
+            
+            // 2. 处理 session.getAttribute
+            traverseAndReplaceSessionGetAttribute(parsedJson.elements);
+
+            // 3. (新) 对所有表格问题进行一次性、全面的修复
+            console.log("正在对表格进行 tbody、样式和 tr 结构的全面修复...");
+            traverseAndProcessAllTableLogic(parsedJson.elements);
+            
+            // 4. (最终) 应用节点过滤和结构扁平化规则
+            console.log("正在应用最终的节点过滤和结构扁平化规则...");
+            parsedJson.elements = processJsonElements(parsedJson.elements);
+
+            return JSON.stringify(parsedJson, null, 2); // 成功
+
         } catch (error) {
             console.error(`Attempt ${attempt}/${maxAttempts} failed: Content is not valid JSON.`);
 
@@ -148,7 +338,6 @@ async function generateAndValidateJson(sessionId, initialContent) {
                 throw new Error("Failed to generate valid JSON after multiple attempts.");
             }
 
-            // 将失败的尝试和修正提示添加到会话历史
             sessions[sessionId].push({ role: "assistant", content: currentContent });
             sessions[sessionId].push({
                 role: "user",
@@ -167,7 +356,7 @@ async function generateAndValidateJson(sessionId, initialContent) {
             for await (const chunk of stream) {
                 regeneratedContent += chunk.choices[0]?.delta?.content || "";
             }
-            currentContent = regeneratedContent; // 更新内容以供下次循环尝试
+            currentContent = regeneratedContent;
         }
     }
 }
@@ -199,7 +388,6 @@ router.post('/chat', async (req, res) => {
 
         sessions[sessionId].push({ role: "user", content: message });
 
-        // 第一步：让 LLM 规划
         const plannerResponse = await openai.chat.completions.create({
             model: process.env.OPENAI_MODEL || "qwen3-coder",
             messages: sessions[sessionId],
@@ -212,7 +400,6 @@ router.post('/chat', async (req, res) => {
         let finalContent;
         let toolResultsForResponse = null;
 
-        // 检查工具调用
         let toolCallsToProcess = responseMessage.tool_calls || [];
         if (toolCallsToProcess.length === 0 && responseMessage.content) {
             const normalizedCalls = await normalizeToolCallsWithLlm(responseMessage.content);
@@ -224,7 +411,6 @@ router.post('/chat', async (req, res) => {
 
         sessions[sessionId].push(responseMessage);
 
-        // --- 工具调用分支 ---
         if (toolCallsToProcess && toolCallsToProcess.length > 0) {
             console.log("助手决定使用工具，开始执行...");
             const toolResults = await handleToolCalls(toolCallsToProcess, sessionId, availableTools);
@@ -248,16 +434,12 @@ router.post('/chat', async (req, res) => {
                 integrationContent += chunk.choices[0]?.delta?.content || "";
             }
 
-            // 验证并可能重新生成内容以确保它是JSON
             finalContent = await generateAndValidateJson(sessionId, integrationContent);
 
         } else {
-            // --- 无需工具 ---
-            // 验证并可能重新生成内容以确保它是JSON
             finalContent = await generateAndValidateJson(sessionId, responseMessage.content);
         }
 
-        // 将最终的、经过验证的助理响应添加到历史记录
         sessions[sessionId].push({ role: "assistant", content: finalContent });
         console.log("结果已返回");
 

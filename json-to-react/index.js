@@ -1,32 +1,34 @@
 import express from 'express';
 import JSON5 from 'json5';
-import { parse } from '@babel/parser'; // <<< 新增：引入Babel解析器
-import { tools, filterAndGenerateReactComponent,handleRouteOutlet,handleActiveXPlaceholder } from "./tools/tools.js";
-import { 
-    openai, 
-    sessions, 
-    fixJsonWithLlm, 
+import { parse } from '@babel/parser';
+import { tools, handleRouteOutlet, handleActiveXPlaceholder } from "./tools/tools.js";
+import {
+    openai,
+    sessions,
+    fixJsonWithLlm,
     normalizeToolCallsWithLlm,
-    initializeSession 
+    initializeSession
 } from "../utils/common.js";
 
-// 创建路由实例而不是应用实例
+// 创建路由实例
 const router = express.Router();
 
 // 系统提示 (保持不变)
 const systemPrompt = `你是一位顶尖的React.js资深开发者，专注于将结构化的JSON中间表示（IR）精确地转换为高效、可维护的React JSX代码。
 根据提供的JSON数据生成React组件(JSX格式)，严格遵循以下规则：
-1. HTML标准标签必须使用完整闭合语法（如<div></div>）
-2. 变量使用useState声明，禁止使用useEffect初始化
-3. 事件处理函数只需定义名称，内容统一用console.log()实现
-4. isComponent为true时为组件引用，componentUrl为组件地址
-5. 正确解析<%...%>中的变量和条件表达式
-6. 最终输出必须是一个有效的、经过清理的jsx代码，不包含任何解释、注释或Markdown代码块。
-7. 当处理tagName为'RouteOutlet'的节点或收到来自'handleRouteOutlet'工具的结果时，你必须:
+1. 输出要保证是一个合法的React组件结构，并使用export default 导出
+2. HTML标准标签必须使用完整闭合语法（如<div></div>）
+3. 变量使用useState声明，禁止使用useEffect初始化
+4. 事件处理函数只需定义名称，内容统一用console.log()实现
+5. isComponent为true时为组件引用，componentUrl为组件地址
+6. 正确解析<%...%>中的变量和条件表达式
+7. 最终输出必须是完整的JSX文件内容
+8. 最终输出必须是一个有效的、经过清理的jsx代码，不包含任何解释、注释或Markdown代码块。
+9. 当处理tagName为'RouteOutlet'的节点或收到来自'handleRouteOutlet'工具的结果时，你必须:
     a. 在文件顶部导入 'useNavigate' hook: import { useNavigate } from 'react-router-dom';
     b. 在组件函数顶部初始化hook: const navigate = useNavigate();
     c. 将该节点渲染为一个可点击的元素(例如<div>)，其onClick事件处理器调用 navigate() 函数进行跳转，跳转路径由节点的'to'属性或工具结果中的'path'字段指定。
-8. 当处理tagName为'ActiveXPlaceholder'的节点必须使用'handleActiveXPlaceholder'工具，收到来自'handleActiveXPlaceholder'工具的结果时，你必须:
+10. 当处理tagName为'ActiveXPlaceholder'的节点必须使用'handleActiveXPlaceholder'工具，收到来自'handleActiveXPlaceholder'工具的结果时，你必须:
     a. 创建一个新的React组件（如果它还不存在），其名称由工具结果中的 'componentName' 字段指定。
     b. 这个组件必须渲染一个带有明显警告样式（例如，红色虚线边框和浅红色背景）的 <div>。
     c. 在 <div> 内部，必须包含一个醒目的H3标题，内容为 "TODO: 替换遗留ActiveX控件"。
@@ -41,8 +43,6 @@ async function handleReactToolCalls(toolCalls, sessionId) {
 
     console.log(`开始执行 ${toolCalls.length} 个工具调用...`);
 
-    // 注意：这里的并行执行逻辑将在后续的路由处理中被分阶段调用，从而保证顺序。
-    // 函数本身保持不变，但调用它的方式会改变。
     const tasks = toolCalls.map((toolCall) => async () => {
         const functionCall = toolCall.function;
         const toolName = functionCall.name;
@@ -51,7 +51,6 @@ async function handleReactToolCalls(toolCalls, sessionId) {
         try {
             let args;
             const rawArguments = functionCall.arguments;
-            console.log(`模型 [${toolName}] 返回的原始参数:`, rawArguments);
 
             try {
                 args = JSON5.parse(rawArguments);
@@ -64,17 +63,11 @@ async function handleReactToolCalls(toolCalls, sessionId) {
             }
 
             let result;
-            // <<< 修改：使用 switch 支持所有工具 >>>
             switch (toolName) {
-                case 'filterAndGenerateReactComponent':
-                    const filterResult = await filterAndGenerateReactComponent(args.unfilteredJson);
-                    // 返回清理后的核心 elements 数组
-                    result = filterResult.elements; 
-                    break;
                 case 'handleRouteOutlet':
                     result = await handleRouteOutlet(args);
                     break;
-                case 'handleActiveXPlaceholder': // <<< 新增：处理 ActiveXPlaceholder 的 case
+                case 'handleActiveXPlaceholder':
                     result = await handleActiveXPlaceholder(args);
                     break;
                 default:
@@ -84,8 +77,6 @@ async function handleReactToolCalls(toolCalls, sessionId) {
                     });
                     return;
             }
-            
-            console.log(`${toolName} 工具执行结果:`, result);
 
             sessions[sessionId].push({
                 role: "tool",
@@ -107,32 +98,22 @@ async function handleReactToolCalls(toolCalls, sessionId) {
     console.log("所有工具调用完成 ✅");
 }
 
-// --- 新增：代码验证与修复辅助函数 ---
 
-/**
- * 使用 @babel/parser 验证生成的React代码是否存在语法错误。
- * 如果代码无效，它将抛出一个错误。
- * @param {string} code - 要验证的React代码字符串。
- */
+// --- 代码验证与修复辅助函数 --- (保持不变)
 async function validateJsxSyntax(code) {
     try {
         parse(code, {
             sourceType: 'module',
-            plugins: ['jsx'], // 启用JSX插件
+            plugins: ['jsx'],
         });
     } catch (error) {
         console.error("JSX语法验证失败:", error.message);
         const syntaxError = new Error(`JSX语法无效: ${error.message}`);
-        syntaxError.code = code; // 将错误代码附加到error对象上，便于返回
+        syntaxError.code = code;
         throw syntaxError;
     }
 }
 
-/**
- * 使用大模型检查并修复React组件中未声明的变量。
- * @param {string} code - 语法正确的React代码。
- * @returns {Promise<string>} - 修复了变量声明的代码。
- */
 async function fixUndeclaredVariables(code) {
     const repairPrompt = `你是一位React专家。你的任务是修复一段React组件代码。
 请检查以下代码，识别所有被使用但未声明的变量。
@@ -140,7 +121,9 @@ async function fixUndeclaredVariables(code) {
 关键规则：初始化时，必须同时声明变量本身及其对应的setter函数。
 例如：如果发现变量 'userName' 未声明，你应该添加 'const [userName, setUserName] = useState(undefined);'。
 不要修改任何已有的代码逻辑，只在顶部添加必要的 'useState' 声明。
-最终只返回完整的、修复后的JSX代码，不包含任何解释或Markdown。`;
+最终只返回完整的、修复后的JSX代码，不包含任何解释或Markdown。
+特殊情况：
+1.sessionStorage.getItem('someKey') 会被视为合法用法，无需修复。`;
 
     try {
         const response = await openai.chat.completions.create({
@@ -151,12 +134,10 @@ async function fixUndeclaredVariables(code) {
             ],
             temperature: 0,
         });
-        
+
         let fixedCode = response.choices[0].message.content || "";
-        // 清理可能出现的Markdown代码块
         fixedCode = fixedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
         
-        console.log("变量修复模型返回的代码:", fixedCode);
         return fixedCode;
 
     } catch (error) {
@@ -166,7 +147,44 @@ async function fixUndeclaredVariables(code) {
 }
 
 
-// --- API 路由 (已更新验证逻辑) ---
+// <<< 修改：实现更智能的工具筛选函数 >>>
+/**
+ * 检查输入消息，并返回一个只包含实际所需工具的数组。
+ * @param {string} message - 用户输入的JSON字符串。
+ * @returns {Array|undefined} - 如果需要工具则返回一个包含所需工具对象的数组，否则返回undefined。
+ */
+function getRequiredToolsForMessage(message) {
+    const requiredTools = [];
+
+    // 定义每个工具名称与其在JSON中的触发关键字之间的映射
+    const toolTriggerMap = {
+        'handleRouteOutlet': '"tagName": "RouteOutlet"',
+        'handleActiveXPlaceholder': '"tagName": "ActiveXPlaceholder"'
+    };
+
+    // 遍历所有可用的工具定义
+    for (const tool of tools) {
+        const toolName = tool.function.name;
+        const triggerKeyword = toolTriggerMap[toolName];
+        
+        // 如果映射中存在该工具，并且message中包含了它的触发关键字
+        if (triggerKeyword && message.includes(triggerKeyword)) {
+            requiredTools.push(tool); // 将这个特定的工具添加到我们的列表中
+            console.log(`检测到关键字，为请求添加工具: ${toolName}`);
+        }
+    }
+
+    // 只有当列表中确实有工具时才返回数组，否则返回undefined
+    if (requiredTools.length > 0) {
+        return requiredTools;
+    }
+
+    console.log("未检测到需要特定工具处理的节点。");
+    return undefined;
+}
+
+
+// --- API 路由 (已更新) ---
 router.post('/generate-react', async (req, res) => {
     try {
         const { message, sessionId = `session_${Date.now()}` } = req.body;
@@ -176,56 +194,30 @@ router.post('/generate-react', async (req, res) => {
 
         initializeSession(sessionId, systemPrompt);
         
-        // 初始用户消息，定义为变量以便后续可能被覆盖
-        let currentUserContent = `请根据以下JSON生成React组件: ${message}`;
+        const currentUserContent = `请根据以下JSON生成React组件: ${message}`;
         sessions[sessionId].push({ role: "user", content: currentUserContent });
 
-        // --- 阶段一: 过滤检查与执行 ---
-        const needsFiltering = /"tagName"\s*:\s*"(html|head|body|title|script|meta|noscript|link)"/i.test(message);
-        console.log(`是否需要调用过滤工具? ${needsFiltering}`);
+        // <<< 修改：调用新的、更智能的工具筛选函数 >>>
+        const availableTools = getRequiredToolsForMessage(message);
 
-        if (needsFiltering) {
-            console.log("--- 进入过滤阶段 ---");
-            // 在此阶段，我们强制模型只使用过滤工具
-            const filterPlannerResponse = await openai.chat.completions.create({
-                model: process.env.OPENAI_MODEL || "gpt-4-turbo",
-                messages: sessions[sessionId],
-                tools: tools.filter(t => t.function.name === 'filterAndGenerateReactComponent'), // 只提供过滤工具
-                tool_choice: { type: "function", function: { name: "filterAndGenerateReactComponent" } }, // 强制调用
-            });
-
-            const filterResponseMessage = filterPlannerResponse.choices[0].message;
-            sessions[sessionId].push(filterResponseMessage); // 保存模型的决策
-
-            if (filterResponseMessage.tool_calls && filterResponseMessage.tool_calls.length > 0) {
-                await handleReactToolCalls(filterResponseMessage.tool_calls, sessionId);
-                console.log("过滤工具执行完毕。");
-                // 过滤完成后，更新用户消息，让下一阶段基于清理后的JSON工作
-                // 注意：我们将工具返回的清理后的JSON作为新的用户指令，这样更清晰
-                const lastToolResult = sessions[sessionId][sessions[sessionId].length - 1];
-                currentUserContent = `过滤完成。请根据以下清理后的JSON数据生成React组件: ${lastToolResult.content}`;
-                sessions[sessionId].push({ role: "user", content: currentUserContent });
-            } else {
-                console.warn("模型决定需要过滤但未成功调用过滤工具，流程将继续使用原始JSON。");
-            }
-        }
-
-        // --- 阶段二: 组件生成与功能性工具调用 ---
-        console.log("--- 进入组件生成阶段 ---");
-        // 在此阶段，模型可以使用除过滤工具外的所有其他工具
-        const componentGenPlannerResponse = await openai.chat.completions.create({
+        const openAiOptions = {
             model: process.env.OPENAI_MODEL || "gpt-4-turbo",
             messages: sessions[sessionId],
-            tools: tools, // 提供所有工具，让模型自行决策（过滤工具此时不会被触发）
-            tool_choice: "auto",
-        });
+        };
+
+        if (availableTools) {
+            openAiOptions.tools = availableTools;
+            openAiOptions.tool_choice = "auto";
+        }
+
+        console.log("--- 进入组件生成阶段 ---");
+        const componentGenPlannerResponse = await openai.chat.completions.create(openAiOptions);
 
         const genResponseMessage = componentGenPlannerResponse.choices[0].message;
         sessions[sessionId].push(genResponseMessage);
 
         let toolCallsToProcess = genResponseMessage.tool_calls || [];
 
-        // (此处的规范化逻辑保持不变)
         if (toolCallsToProcess.length === 0 && genResponseMessage.content) {
             console.log("未找到标准 tool_calls，尝试从 content 内容中规范化...");
             const normalizedCalls = await normalizeToolCallsWithLlm(genResponseMessage.content);
@@ -237,11 +229,11 @@ router.post('/generate-react', async (req, res) => {
 
         const hasToolCalls = toolCallsToProcess && toolCallsToProcess.length > 0;
         if (hasToolCalls) {
-            console.log("助手决定使用功能性工具 (如路由、占位符)，开始执行...");
+            console.log("助手决定使用功能性工具，开始执行...");
             await handleReactToolCalls(toolCallsToProcess, sessionId);
         }
 
-        // --- 统一的代码生成、验证与修复循环 (此部分逻辑保持不变) ---
+        // --- 统一的代码生成、验证与修复循环 (保持不变) ---
         let finalReactCode = "";
         let isCodeValid = false;
         let attempts = 0;
@@ -255,7 +247,7 @@ router.post('/generate-react', async (req, res) => {
             console.log(`--- 开始第 ${attempts}/${maxAttempts} 次代码生成与验证 ---`);
             
             try {
-                if (attempts === 1 && !hasToolCalls && !needsFiltering) {
+                if (attempts === 1 && !hasToolCalls) {
                     generatedCode = genResponseMessage.content || "";
                 } else {
                     const finalResponse = await openai.chat.completions.create({
@@ -285,7 +277,7 @@ router.post('/generate-react', async (req, res) => {
                 }
             }
         }
-        
+        console.log('结果已生成')
         if (isCodeValid) {
             res.json({ success: true, reactCode: finalReactCode, sessionId });
         } else {
@@ -303,5 +295,5 @@ router.post('/generate-react', async (req, res) => {
     }
 });
 
-// 导出路由而不是启动服务器
+// 导出路由
 export default router;
