@@ -101,7 +101,8 @@ async function handleReactToolCalls(toolCalls, sessionId) {
 }
 
 
-// --- 代码验证与修复辅助函数 --- (保持不变)
+// --- 代码验证与修复辅助函数 ---
+
 async function validateJsxSyntax(code) {
     try {
         parse(code, {
@@ -116,16 +117,24 @@ async function validateJsxSyntax(code) {
     }
 }
 
+// <<< 修改：函数现在返回一个对象，包含代码和被声明的变量列表 >>>
 async function fixUndeclaredVariables(code) {
     const repairPrompt = `你是一位React专家。你的任务是修复一段React组件代码。
 请检查以下代码，识别所有被使用但未声明的变量。
 对于每一个未声明的变量，必须在组件顶部使用 'useState' hook 进行初始化。
 关键规则：初始化时，必须同时声明变量本身及其对应的setter函数。
 例如：如果发现变量 'userName' 未声明，你应该添加 'const [userName, setUserName] = useState(undefined);'。
-不要修改任何已有的代码逻辑，只在顶部添加必要的 'useState' 声明。
-最终只返回完整的、修复后的${fileType.toUpperCase()}代码，不包含任何解释或Markdown。
+不要修改任何已有的代码逻辑。
+
+最终你的输出必须是一个合法的JSON对象，结构如下:
+{
+  "fixedCode": "...", // 包含已添加useState声明的完整React代码字符串
+  "declaredVariables": ["...", "..."] // 一个字符串数组，仅包含你新声明的变量的名称
+}
+
 特殊情况：
-1.sessionStorage.getItem('someKey') 会被视为合法用法，无需修复。`;
+1. 'sessionStorage.getItem('someKey')' 会被视为合法用法，无需修复。
+2. 不要将 'React' 或 'useState' 本身添加到 declaredVariables 数组中。`;
 
     try {
         const response = await openai.chat.completions.create({
@@ -135,81 +144,95 @@ async function fixUndeclaredVariables(code) {
                 { role: "user", content: code }
             ],
             temperature: 0,
+            response_format: { type: "json_object" }, // 强制模型输出JSON格式
         });
 
-        let fixedCode = response.choices[0].message.content || "";
-        fixedCode = fixedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
+        const result = JSON.parse(response.choices[0].message.content || "{}");
         
-        return fixedCode;
+        return {
+            fixedCode: result.fixedCode || code,
+            declaredVariables: result.declaredVariables || [],
+        };
 
     } catch (error) {
         console.error("使用大模型修复变量时出错:", error);
-        throw new Error("使用大模型修复变量时失败。");
+        // 如果出错，则返回原始代码且不添加可选链
+        return { fixedCode: code, declaredVariables: [] };
     }
 }
 
 
-// <<< 新增：语法转换字典 >>>
-/**
- * 语法转换字典.
- * 键是用于匹配的正则表达式.
- * 值是替换字符串或一个函数，用于动态替换.
- * 'g' 标志用于全局替换.
- */
-const syntaxDictionary = {
-    // 转换 .isEmpty() 为 !== ""
-    "\\.isEmpty\\(\\)": '!== ""',
-};
+// 语法转换规则表 (静态规则)
+const syntaxDictionary = [
+    {
+        match: (line) => /\.isEmpty\(\)/.test(line),
+        fix: (line) => line.replace(/\.isEmpty\(\)/g, ' !== ""'),
+    },
+    {
+        match: (line) => /timeFormat\.format\(now\.getTime\(\)\)/.test(line),
+        fix: (line) => line.replace(/timeFormat\.format\(now\.getTime\(\)\)/g, "new Date().toLocaleTimeString('en-US', { hour12: true })"),
+    },
+    {
+        match: (line) => /action=\{UAcRequestUtility\.sanitizeForMultiLine\(OKURL\)\}/.test(line),
+        fix: (line) => line.replace(/action=\{UAcRequestUtility\.sanitizeForMultiLine\(OKURL\)\}/g, 'action=""'),
+    },
+];
 
-// <<< 新增：应用语法转换的函数 >>>
+// <<< 修改：函数现在接受变量列表，以动态应用可选链 >>>
 /**
- * 根据语法字典转换代码.
- * @param {string} code - 需要转换的代码.
- * @returns {string} - 转换后的代码.
+ * 根据规则表转换代码，并为特定变量的方法调用动态添加可选链。
+ * @param {string} code - 需要进行语法转换的原始代码字符串。
+ * @param {string[]} variablesToMakeOptional - 一个数组，包含需要为其方法调用添加可选链的变量名。
+ * @returns {string} - 应用所有转换规则后的代码字符串。
  */
-function applySyntaxTransformations(code) {
-    let transformedCode = code;
-    for (const pattern in syntaxDictionary) {
-        const replacement = syntaxDictionary[pattern];
-        try {
-            const regex = new RegExp(pattern, 'g');
-            transformedCode = transformedCode.replace(regex, replacement);
-        } catch (error) {
-            console.error(`应用语法转换时出错: ${error.message}`);
+function applySyntaxTransformations(code, variablesToMakeOptional = []) {
+    // 1. 首先，应用来自 syntaxDictionary 的静态转换规则
+    const lines = code.split('\n');
+    let transformedCode = lines.map(line => {
+        let currentLine = line;
+        for (const rule of syntaxDictionary) {
+            if (rule.match(currentLine)) {
+                currentLine = rule.fix(currentLine);
+            }
         }
+        return currentLine;
+    }).join('\n');
+
+    // 2. 然后，如果需要，动态地为特定变量添加可选链
+    if (variablesToMakeOptional.length > 0) {
+        // 创建一个正则表达式，匹配列表中的任何一个变量名，后面跟着一个点 '.'
+        // \b 确保匹配的是完整的单词
+        const unsafeVariablesPattern = new RegExp(
+            `\\b(${variablesToMakeOptional.join('|')})\\.`, 'g'
+        );
+        
+        // 将 "variable." 替换为 "variable?."
+        transformedCode = transformedCode.replace(unsafeVariablesPattern, '$1?.');
+        console.log(`已为变量 [${variablesToMakeOptional.join(', ')}] 的方法调用添加了可选链操作符。`);
     }
+
     return transformedCode;
 }
 
 
-// <<< 修改：实现更智能的工具筛选函数 >>>
-/**
- * 检查输入消息，并返回一个只包含实际所需工具的数组。
- * @param {string} message - 用户输入的JSON字符串。
- * @returns {Array|undefined} - 如果需要工具则返回一个包含所需工具对象的数组，否则返回undefined。
- */
+// --- 智能工具筛选函数 --- (保持不变)
 function getRequiredToolsForMessage(message) {
     const requiredTools = [];
-
-    // 定义每个工具名称与其在JSON中的触发关键字之间的映射
     const toolTriggerMap = {
         'handleRouteOutlet': '"tagName": "RouteOutlet"',
         'handleActiveXPlaceholder': '"tagName": "ActiveXPlaceholder"'
     };
 
-    // 遍历所有可用的工具定义
     for (const tool of tools) {
         const toolName = tool.function.name;
         const triggerKeyword = toolTriggerMap[toolName];
         
-        // 如果映射中存在该工具，并且message中包含了它的触发关键字
         if (triggerKeyword && message.includes(triggerKeyword)) {
-            requiredTools.push(tool); // 将这个特定的工具添加到我们的列表中
+            requiredTools.push(tool);
             console.log(`检测到关键字，为请求添加工具: ${toolName}`);
         }
     }
 
-    // 只有当列表中确实有工具时才返回数组，否则返回undefined
     if (requiredTools.length > 0) {
         return requiredTools;
     }
@@ -219,7 +242,7 @@ function getRequiredToolsForMessage(message) {
 }
 
 
-// --- API 路由 (已更新) ---
+// --- API 路由 (已更新以集成新流程) ---
 router.post('/generate-react', async (req, res) => {
     try {
         const { message, sessionId = `session_${Date.now()}` } = req.body;
@@ -232,7 +255,6 @@ router.post('/generate-react', async (req, res) => {
         const currentUserContent = `请根据以下JSON生成React组件: ${message}`;
         sessions[sessionId].push({ role: "user", content: currentUserContent });
 
-        // <<< 修改：调用新的、更智能的工具筛选函数 >>>
         const availableTools = getRequiredToolsForMessage(message);
 
         const openAiOptions = {
@@ -297,11 +319,14 @@ router.post('/generate-react', async (req, res) => {
                 generatedCode = generatedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
                 if (!generatedCode) throw new Error("模型生成了空代码。");
                 
+                // 首先，验证原始的JSX语法
                 await validateJsxSyntax(generatedCode);
-                let fixedCode = await fixUndeclaredVariables(generatedCode);
                 
-                // <<< 新增：在最终验证前应用语法转换 >>>
-                finalReactCode = applySyntaxTransformations(fixedCode);
+                // <<< 修改：同时捕获修复后的代码和新声明的变量列表 >>>
+                const { fixedCode, declaredVariables } = await fixUndeclaredVariables(generatedCode);
+                
+                // <<< 修改：将变量列表传递给转换函数，以动态添加可选链 >>>
+                finalReactCode = applySyntaxTransformations(fixedCode, declaredVariables);
                 
                 isCodeValid = true;
 

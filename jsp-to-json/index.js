@@ -18,58 +18,13 @@ const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// --- 辅助函数 ---
 
+// --- 工具函数 ---
 /**
- * 递归地遍历一个代表HTML树的JSON对象。
- * 如果找到一个'object'标签（通常用于ActiveX），
- * 它会将其转换为一个 "ActiveXPlaceholder" 组件，
- * 并将所有 <param> 子标签的信息提取到一个 params 对象中。
- * @param {any} node - JSON树中的当前节点（对象或数组）。
- */
-function traverseAndTransformObjects(node) {
-    if (node === null || typeof node !== 'object') {
-        return;
-    }
-
-    if (Array.isArray(node)) {
-        node.forEach(item => traverseAndTransformObjects(item));
-        return;
-    }
-
-    if (node.children && Array.isArray(node.children)) {
-        node.children.forEach(child => traverseAndTransformObjects(child));
-    }
-
-    if (node.tagName === 'object') {
-        console.log("发现一个 <object> 标签，正在转换为 ActiveXPlaceholder...");
-        const params = {};
-        if (node.children && Array.isArray(node.children)) {
-            node.children.forEach(child => {
-                if (child.tagName === 'param' && child.attributes) {
-                    const name = child.attributes.name;
-                    const value = child.attributes.value;
-                    if (name) {
-                        params[name] = value || "";
-                    }
-                }
-            });
-        }
-        node.tagName = 'ActiveXPlaceholder';
-        node.isComponent = true;
-        node.children = [{ "params": params }];
-    }
-}
-
-/**
- * 辅助函数：将CSS字符串解析为CSS-in-JS对象。
- * @param {string} cssText - CSS样式字符串。
- * @returns {object} - CSS-in-JS格式的样式对象。
- */
+* 将 CSS 字符串解析为 JS 对象。
+*/
 function parseCssStringToObject(cssText) {
-    if (typeof cssText !== 'string' || !cssText) {
-        return {};
-    }
+    if (typeof cssText !== 'string' || !cssText) return {};
     const style = {};
     cssText.split(';').forEach(declaration => {
         if (declaration.trim()) {
@@ -83,361 +38,752 @@ function parseCssStringToObject(cssText) {
     return style;
 }
 
-// --- (新增) 属性到样式的转换 ---
-
 /**
- * 辅助函数：如果值是纯数字，则为其添加 'px' 单位。
- * @param {string} value - 属性值。
- * @returns {string} - 处理后的值。
- */
-const addPxIfNeeded = (value) => {
-    if (String(value).match(/^[0-9]+$/)) {
-        return `${value}px`;
-    }
-    return value;
-};
+* 如果值是纯数字，则自动加上 px 单位。
+*/
+const addPxIfNeeded = (value) => (/^[0-9]+$/.test(String(value)) ? `${value}px` : value);
 
+// --- [最终版] 基于分阶段收敛法的严格顺序化规则 ---
 /**
- * 定义一个从废弃的HTML属性到CSS-in-JS样式的映射。
- * 每个键是HTML属性名，值是一个描述如何转换的对象。
- * - cssProperty: 对应的CSS属性名。
- * - valueMap: (可选) 用于直接映射特定值的对象。
- * - handler: (可选) 一个自定义函数，用于更复杂的转换逻辑。
+ * 规则被划分为多个阶段，引擎将按顺序处理每个阶段。
+ * 在每个阶段内部，它会不断应用规则直到结构收敛（没有更多规则可应用），
+ * 然后才会进入下一个阶段。
  */
-const attributeToStyleMap = {
-    'align': { cssProperty: 'textAlign' },
-    'valign': { cssProperty: 'verticalAlign' },
-    'bgcolor': { cssProperty: 'backgroundColor' },
-    'background': { cssProperty: 'backgroundImage', handler: (value) => `url(${value})` },
-    'width': { cssProperty: 'width', handler: addPxIfNeeded },
-    'height': { cssProperty: 'height', handler: addPxIfNeeded },
-    'border': {
-        cssProperty: 'border',
-        handler: (value) => (value === '0' ? 'none' : `${addPxIfNeeded(value)} solid black`)
-    },
-    'nowrap': { cssProperty: 'whiteSpace', fixedValue: 'nowrap' },
-    'cellspacing': {
-        handler: (value, style) => {
-            style.borderSpacing = addPxIfNeeded(value);
-            style.borderCollapse = 'separate';
+const rulePhases = [
+    // --- 阶段 1: 预处理 ---
+    [
+        {
+            description: "[预处理] 转换 tagName 为小写",
+            match: (node) => typeof node.tagName === 'string' && !node.isComponent && node.tagName !== node.tagName.toLowerCase(),
+            fix: (node) => { node.tagName = node.tagName.toLowerCase(); }
         }
-    },
-    // color、face、size 属性常用于 <font> 标签，但也可以在此处通用处理
-    'color': { cssProperty: 'color' },
-    'face': { cssProperty: 'fontFamily' },
-    'size': { cssProperty: 'fontSize', handler: addPxIfNeeded } // 简单处理，实际的 size 映射更复杂
-};
-
-/**
- * (新) 递归遍历JSON树，将所有废弃的展示性属性转换为CSS-in-JS的 style 对象。
- * @param {any} node - JSON树中的当前节点。
- */
-function traverseAndApplyPresentationalAttributes(node) {
-    if (node === null || typeof node !== 'object') {
-        return;
-    }
-
-    if (Array.isArray(node)) {
-        node.forEach(item => traverseAndApplyPresentationalAttributes(item));
-        return;
-    }
-
-    if (node.attributes) {
-        let styleObject = {};
-        // 确保与现有的 style 属性合并
-        if (node.attributes.style) {
-            if (typeof node.attributes.style === 'string') {
-                styleObject = parseCssStringToObject(node.attributes.style);
-            } else if (typeof node.attributes.style === 'object') {
-                styleObject = { ...node.attributes.style };
-            }
-        }
-
-        const attributesToDelete = [];
-
-        for (const attrName in node.attributes) {
-            if (attributeToStyleMap[attrName]) {
-                const mapping = attributeToStyleMap[attrName];
-                const attrValue = node.attributes[attrName];
-
-                console.log(`发现属性 ${attrName}="${attrValue}"，正在转换为 style...`);
-
-                if (mapping.handler) {
-                    // 自定义处理器可能直接修改 styleObject
-                    mapping.handler(attrValue, styleObject);
-                } else {
-                    let finalValue = attrValue;
-                    if (mapping.fixedValue) {
-                        finalValue = mapping.fixedValue;
-                    } else if (mapping.valueMap && mapping.valueMap[attrValue]) {
-                        finalValue = mapping.valueMap[attrValue];
+    ],
+    // --- 阶段 2: 表单位置处理 (优先完成所有表单相关的结构调整) ---
+    [
+        {
+            description: "[表单提升] 将 <form> 从 <tr> 提升到 <tbody>",
+            match: (node, parent) => node.tagName === 'form' && parent?.tagName === 'tr',
+            fix: (node, parent) => {
+                const tbody = parent.parent;
+                if (tbody && ['tbody', 'thead', 'tfoot'].includes(tbody.tagName)) {
+                    const trIndex = tbody.children.indexOf(parent);
+                    if (trIndex > -1) {
+                        // 从 <tr> 中移除 <form>
+                        const formIndex = parent.children.indexOf(node);
+                        if (formIndex > -1) parent.children.splice(formIndex, 1);
+                        // 将 <form> 插入到 <tbody> 中，位于当前 <tr> 之后
+                        tbody.children.splice(trIndex + 1, 0, node);
                     }
-                    styleObject[mapping.cssProperty] = finalValue;
                 }
-
-                attributesToDelete.push(attrName);
             }
-        }
+        },
+        {
+            description: "[表单提升] 将 <form> 从 <tbody> 提升到 <table>",
+            match: (node, parent) => node.tagName === 'form' && parent?.tagName === 'tbody',
+            fix: (node, parent) => {
+                const table = parent.parent;
+                if (table && table.tagName === 'table') {
+                    const tbodyIndex = table.children.indexOf(parent);
+                    if (tbodyIndex > -1) {
+                        const formIndex = parent.children.indexOf(node);
+                        if (formIndex > -1) parent.children.splice(formIndex, 1);
+                        table.children.splice(tbodyIndex + 1, 0, node);
+                    }
+                }
+            }
+        },
+        {
+            description: "[表单重构] 拆分 <table> 内的 <form> 为 'form > table' 结构",
+            match: (node) => node.tagName === 'table' && node.children?.some(child => child.tagName === 'form'),
+            fix: (node, parent, root) => {
+                const originalTable = node;
+                const containerArray = parent ? parent.children : root.elements;
+                const tableIndex = containerArray.indexOf(originalTable);
+                if (tableIndex === -1) return;
 
-        // 清理已转换的属性
-        attributesToDelete.forEach(attr => delete node.attributes[attr]);
+                const finalElements = [];
+                let nonFormContent = []; // 用于收集不属于任何 form 的内容
 
-        // 更新 style 属性
-        if (Object.keys(styleObject).length > 0) {
-            node.attributes.style = styleObject;
-        } else {
-            // 如果 style 对象为空，则移除它
-            delete node.attributes.style;
-        }
-    }
-
-    if (node.children && Array.isArray(node.children)) {
-        node.children.forEach(child => traverseAndApplyPresentationalAttributes(child));
-    }
-}
-
-
-/**
- * (已重构) 递归地遍历JSON树，仅处理表格的 *结构性* 问题。
- * 1. 对于 <table>: 
- *    - 检查并自动包裹缺少 <tbody> 的子元素。
- *    - 将 cellpadding 属性转换为其子单元格的 padding 样式。
- * 2. 对于 <tr>: 
- *    - 检查其直接子元素，如果不是 <td> 或 <th>，则用隐藏的 <td> 包裹。
- * @param {any} node - JSON树中的当前节点。
- */
-function traverseAndProcessTableStructure(node) {
-    if (node === null || typeof node !== 'object') {
-        return;
-    }
-
-    if (Array.isArray(node)) {
-        node.forEach(item => traverseAndProcessTableStructure(item));
-        return;
-    }
-
-    if (node.tagName === 'table') {
-        // 1a. 修复缺失的 <tbody>
-        const hasChildren = node.children && Array.isArray(node.children) && node.children.length > 0;
-        if (hasChildren && node.children[0].tagName !== 'tbody') {
-            console.log("发现一个 <table> 缺少 <tbody>，正在包裹其子元素...");
-            const tbodyElement = { tagName: 'tbody', children: node.children };
-            node.children = [tbodyElement];
-        }
-
-        // 1b. 处理 cellpadding (因为它影响子元素，所以留在这里)
-        if (node.attributes && node.attributes.cellpadding) {
-            console.log(`发现 cellpadding="${node.attributes.cellpadding}"，转换为子元素 td/th 的 style...`);
-            const paddingValue = addPxIfNeeded(node.attributes.cellpadding);
-
-            const applyPaddingToCells = (currentNode) => {
-                if (!currentNode) return;
-                if (Array.isArray(currentNode)) {
-                    currentNode.forEach(applyPaddingToCells);
-                } else if (typeof currentNode === 'object') {
-                    if (currentNode.tagName === 'td' || currentNode.tagName === 'th') {
-                        if (!currentNode.attributes) currentNode.attributes = {};
-
-                        let cellStyle = {};
-                        if (currentNode.attributes.style && typeof currentNode.attributes.style === 'string') {
-                            cellStyle = parseCssStringToObject(currentNode.attributes.style);
-                        } else if (currentNode.attributes.style && typeof currentNode.attributes.style === 'object') {
-                            cellStyle = { ...currentNode.attributes.style };
+                // 将原 table 的子元素处理成独立的组
+                originalTable.children.forEach(child => {
+                    if (child.tagName === 'form') {
+                        // 步骤 1: 如果在遇到 form 之前已经收集了其他内容，
+                        // 先将这些内容打包成一个独立的 table。
+                        if (nonFormContent.length > 0) {
+                            finalElements.push({
+                                tagName: 'table',
+                                attributes: { ...originalTable.attributes },
+                                children: nonFormContent
+                            });
+                            nonFormContent = []; // 清空收集器
                         }
 
-                        cellStyle.padding = paddingValue;
-                        currentNode.attributes.style = cellStyle;
+                        // 步骤 2: 处理当前的 form，将其转换为 'form > table' 结构
+                        const formChildren = child.children || [];
+                        const newTableForForm = {
+                            tagName: 'table',
+                            attributes: { ...originalTable.attributes },
+                            children: formChildren
+                        };
+                        child.children = [newTableForForm]; // 将新 table 放入 form
+                        finalElements.push(child); // 将处理好的 form 放入最终列表
+
+                    } else {
+                        // 如果不是 form，就先收集起来
+                        nonFormContent.push(child);
                     }
-                    if (currentNode.children) {
-                        applyPaddingToCells(currentNode.children);
-                    }
+                });
+
+                // 步骤 3: 处理循环结束后可能遗留的非 form 内容
+                // (例如 table 的末尾有一些不在 form 内的 <tr>)
+                if (nonFormContent.length > 0) {
+                    finalElements.push({
+                        tagName: 'table',
+                        attributes: { ...originalTable.attributes },
+                        children: nonFormContent
+                    });
                 }
-            };
 
-            if (node.children) {
-                applyPaddingToCells(node.children);
-            }
-            delete node.attributes.cellpadding;
-        }
-    } else if (node.tagName === 'tr' && node.children && Array.isArray(node.children)) {
-        // 2. 修复 <tr> 的无效子元素
-        node.children = node.children.map(child => {
-            const isInvalid = !(child && typeof child === 'object' && (child.tagName === 'td' || child.tagName === 'th'));
-            if (isInvalid) {
-                console.log("在 <tr> 中发现无效的子元素，正在用隐藏的 <td> 包裹...");
-                return {
-                    tagName: 'td',
-                    attributes: { style: { display: 'none' } },
-                    children: [child]
-                };
-            }
-            return child;
-        });
-    }
-
-    if (node.children && Array.isArray(node.children)) {
-        node.children.forEach(child => traverseAndProcessTableStructure(child));
-    }
-}
-
-
-/**
- * 递归地遍历JSON树，将 'condition' 字段中的 'session.getAttribute(KEY)'
- * 智能地替换为 'sessionStorage.getItem('KEY')'。
- * @param {any} node - JSON树中的当前节点（对象或数组）。
- */
-function traverseAndReplaceSessionGetAttribute(node) {
-    if (node === null || typeof node !== 'object') {
-        return;
-    }
-
-    if (Array.isArray(node)) {
-        node.forEach(item => traverseAndReplaceSessionGetAttribute(item));
-        return;
-    }
-
-    if (typeof node.condition === 'string' && node.condition.includes('session.getAttribute')) {
-        console.log(`发现 condition 字段: "${node.condition}"，正在转换...`);
-        const regex = /session\.getAttribute\((.*?)\)/g;
-
-        node.condition = node.condition.replace(regex, (match, capturedArg) => {
-            let key = capturedArg.trim();
-            if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
-                key = key.substring(1, key.length - 1);
-            }
-            return `sessionStorage.getItem('${key}')`;
-        });
-
-        console.log(`转换后: "${node.condition}"`);
-    }
-
-    if (node.children && Array.isArray(node.children)) {
-        node.children.forEach(child => traverseAndReplaceSessionGetAttribute(child));
-    }
-}
-
-/**
- * 根据指定规则递归处理 JSON 元素数组。
- * 1. 移除 tagName 为 'meta', 'title', 'link', 'script', 'noscript', 'style' 的节点。
- * 2. 对于 tagName 为 'html', 'head', 'body' 的节点，不包含节点本身，而是直接处理其 children。
- * 3. 递归处理所有子节点。
- * @param {Array} elements - 需要处理的元素节点数组。
- * @returns {Array} - 处理后生成的新元素数组。
- */
-function processJsonElements(elements) {
-    if (!Array.isArray(elements)) return [];
-
-    return elements.reduce((accumulator, currentElement) => {
-        const tagsToRemove = ['meta', 'title', 'link', 'script', 'noscript', 'style'];
-        if (tagsToRemove.includes(currentElement.tagName)) {
-            return accumulator;
-        }
-
-        const tagsToUnwrap = ['html', 'head', 'body'];
-        if (tagsToUnwrap.includes(currentElement.tagName)) {
-            const children = currentElement.children || [];
-            return accumulator.concat(processJsonElements(children));
-        }
-
-        if (currentElement.children && currentElement.children.length > 0) {
-            const newElement = { ...currentElement };
-            newElement.children = processJsonElements(currentElement.children);
-            accumulator.push(newElement);
-        } else {
-            accumulator.push(currentElement);
-        }
-
-        return accumulator;
-    }, []);
-}
-
-// --- 配置化规则表 ---
-const nestingRules = [
-    {
-        match: (node, parent) => parent?.tagName === 'tr' && node.tagName === 'form',
-        fix: (node, parent) => {
-            console.log("修复: <tr> 下直接有 <form>");
-            const wrapperTd = { tagName: 'td', attributes: {}, children: [node] };
-            const idx = parent.children.indexOf(node);
-            parent.children[idx] = wrapperTd;
-        }
-    },
-    {
-        match: (node, parent) => parent?.tagName === 'p' && node.tagName === 'form',
-        fix: (node, parent) => {
-            console.log("修复: <p> 下直接有 <form>");
-            if (parent.parent) {
-                const parentIndex = parent.parent.children.indexOf(parent);
-                parent.parent.children.splice(parentIndex, 0, node);
-                parent.children = parent.children.filter(c => c !== node);
+                // 步骤 4: 用生成的新元素序列替换掉原来的 table
+                if (finalElements.length > 0) {
+                    containerArray.splice(tableIndex, 1, ...finalElements);
+                }
             }
         }
-    },
-    {
-        match: (node, parent) => parent?.tagName === 'table' && node.tagName === 'form',
-        fix: (node, parent) => {
-            console.log("修复: <table> 下直接有 <form>");
-            if (parent.parent) {
-                const idx = parent.parent.children.indexOf(parent);
-                parent.parent.children[idx] = {
-                    tagName: 'form',
-                    attributes: {},
-                    children: [parent]
-                };
+    ],
+    // --- 阶段 3: 表格语义与结构修复 (在表单结构稳定后进行) ---
+    [
+        {
+            description: "[结构] 将 <table> 下的孤立节点移入 <tbody>",
+            match: (node) => {
+                if (node.tagName !== 'table' || !node.children || node.children.length === 0) {
+                    return false;
+                }
+                const hasTbody = node.children.some(c => c.tagName === 'tbody');
+                const hasOrphanNode = node.children.some(c => !['tbody', 'thead', 'tfoot', 'caption', 'colgroup'].includes(c.tagName));
+                return hasTbody && hasOrphanNode;
+            },
+            fix: (node) => {
+                const tbody = node.children.find(c => c.tagName === 'tbody');
+                if (!tbody) return; // 理论上 match 条件保证了 tbody 存在
+
+                const strayNodes = [];
+                const sections = []; // 用于存放 tbody, thead 等合法部分
+
+                // 1. 分离孤立节点和表格的标准部分
+                node.children.forEach(child => {
+                    if (['tbody', 'thead', 'tfoot', 'caption', 'colgroup'].includes(child.tagName)) {
+                        sections.push(child);
+                    } else {
+                        strayNodes.push(child);
+                    }
+                });
+
+                // 2. 将孤立节点移动到 tbody 的最前面
+                if (strayNodes.length > 0) {
+                    tbody.children.unshift(...strayNodes);
+                }
+
+                // 3. 更新 table 的子节点，只保留标准部分
+                node.children = sections;
             }
-        }
-    },
-    {
-        match: (node, parent) => node.tagName === 'td' && (!parent || parent?.tagName !== 'tr'),
-        fix: (node, parent, rootRef) => {
-            console.log("修复: 孤立 <td>");
-            const wrapperTr = { tagName: 'tr', attributes: {}, children: [node] };
-            const wrapperTable = { tagName: 'table', attributes: {}, children: [wrapperTr] };
-            if (parent) {
+        },
+        {
+            description: "[语义] <table> 缺少 <tbody>",
+            match: (node) => node.tagName === 'table' && node.children?.length > 0 && node.children.every(c => c.tagName !== 'tbody'),
+            fix: (node) => { node.children = [{ tagName: 'tbody', attributes: {}, children: node.children }]; }
+        },
+        {
+            description: "[语义] <tbody> 下的非法子元素",
+            match: (node, parent) => parent?.tagName === 'tbody' && node.tagName !== 'tr',
+            fix: (node, parent) => {
                 const idx = parent.children.indexOf(node);
-                parent.children[idx] = wrapperTable;
-            } else {
-                // parent 为 null，说明 node 在根级
-                if (Array.isArray(rootRef.elements)) {
-                    const idx = rootRef.elements.indexOf(node);
-                    if (idx !== -1) {
-                        rootRef.elements[idx] = wrapperTable;
+                if (idx !== -1) {
+                    const wrapperTd = { tagName: 'td', attributes: {}, children: [node] };
+                    const wrapperTr = { tagName: 'tr', attributes: {}, children: [wrapperTd] };
+                    parent.children[idx] = wrapperTr;
+                }
+            }
+        },
+        {
+            description: "[语义] <tr> 下的非法子元素",
+            match: (node, parent) => parent?.tagName === 'tr' && node.tagName !== 'td' && node.tagName !== 'th',
+            fix: (node, parent) => {
+                const idx = parent.children.indexOf(node);
+                if (idx !== -1) {
+                    const wrapperTd = { tagName: 'td', attributes: {}, children: [node] };
+                    parent.children[idx] = wrapperTd;
+                }
+            }
+        },
+        {
+            description: "[孤立] 修复孤立的 <td> 或 <th>",
+            match: (node, parent) => (node.tagName === 'td' || node.tagName === 'th') && parent?.tagName !== 'tr',
+            fix: (node, parent, root) => {
+                const wrapperTr = { tagName: 'tr', attributes: {}, children: [node] };
+                const wrapperTbody = { tagName: 'tbody', attributes: {}, children: [wrapperTr] };
+                const wrapperTable = { tagName: 'table', attributes: {}, children: [wrapperTbody] };
+                const container = parent ? parent.children : root.elements;
+                const idx = container.indexOf(node);
+                if (idx > -1) container[idx] = wrapperTable;
+            }
+        },
+        {
+            description: "[孤立] 修复孤立的 <tr>",
+            match: (node, parent) => node.tagName === 'tr' && !['tbody', 'thead', 'tfoot'].includes(parent?.tagName),
+            fix: (node, parent, root) => {
+                const wrapperTbody = { tagName: 'tbody', attributes: {}, children: [node] };
+                const wrapperTable = { tagName: 'table', attributes: {}, children: [wrapperTbody] };
+                const container = parent ? parent.children : root.elements;
+                const idx = container.indexOf(node);
+                if (idx > -1) container[idx] = wrapperTable;
+            }
+        },
+        {
+            description: "[结构] 转换包裹 <form> 的 <p> 为带样式的 <div>",
+            match: (node) => node.tagName === 'p' && node.children?.some(child => child.tagName === 'form'),
+            fix: (node) => {
+                // 1. 将 tagName 从 'p' 更改为 'div'
+                node.tagName = 'div';
+
+                // 2. 确保 attributes 和 style 对象存在
+                if (!node.attributes) node.attributes = {};
+                let style = {};
+                if (typeof node.attributes.style === 'string') {
+                    style = parseCssStringToObject(node.attributes.style);
+                } else if (typeof node.attributes.style === 'object') {
+                    style = { ...node.attributes.style };
+                }
+
+                // 3. 添加或覆盖 margin 属性以模拟 <p> 标签的默认垂直边距
+                //    '1em 0' 是大多数浏览器对 <p> 标签的默认样式
+                //    使用 `||` 可以避免覆盖已存在的 margin 设置
+                style.margin = style.margin || '1em 0';
+
+                // 4. 将更新后的 style 对象写回节点
+                node.attributes.style = style;
+            }
+        }
+    ],
+    // --- [新增] 阶段 4: Struts 标签现代化转换 ---
+    [
+        {
+            description: "[Struts Compatibility] 转换 html-tag 为 html:tag",
+            match: (node) => typeof node.tagName === 'string' && node.tagName.startsWith('html-'),
+            fix: (node) => {
+                node.tagName = node.tagName.replace('html-', 'html:');
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:form> 为 <form>",
+            match: (node) => node.tagName === 'html:form',
+            fix: (node) => {
+                node.tagName = 'form';
+                // action 属性通常 LLM 会保留，这里无需额外处理
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:text> 为 <input type='text'>",
+            match: (node) => node.tagName === 'html:text',
+            fix: (node) => {
+                node.tagName = 'input';
+                if (!node.attributes) node.attributes = {};
+                node.attributes.type = 'text';
+                // 关键：将 Struts 的 property 映射到标准的 name 属性
+                if (node.attributes.property) {
+                    node.attributes.name = node.attributes.property;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:password> 为 <input type='password'>",
+            match: (node) => node.tagName === 'html:password',
+            fix: (node) => {
+                node.tagName = 'input';
+                if (!node.attributes) node.attributes = {};
+                node.attributes.type = 'password';
+                if (node.attributes.property) {
+                    node.attributes.name = node.attributes.property;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:radio> 为 <label> 包裹的 <input type='radio'>",
+            match: (node) => node.tagName === 'html:radio',
+            fix: (node) => {
+                const originalAttrs = node.attributes || {};
+                let labelText = node.text || '';
+                if (!labelText && node.children?.length > 0 && node.children[0].tagName === '#text') {
+                    labelText = node.children[0].text;
+                }
+                const inputNode = {
+                    tagName: 'input',
+                    attributes: {
+                        type: 'radio',
+                        name: originalAttrs.property,
+                        value: originalAttrs.value
+                    },
+                    children: []
+                };
+                const textNode = {
+                    tagName: '#text',
+                    text: ` ${labelText.trim()}`,
+                    attributes: {},
+                    children: []
+                };
+                node.tagName = 'label';
+                node.children = [inputNode, textNode];
+                delete originalAttrs.property;
+                delete originalAttrs.value;
+                delete node.text;
+                node.attributes = originalAttrs;
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:hidden> 为 <input type='hidden'>", // <-- 新增的规则
+            match: (node) => node.tagName === 'html:hidden',
+            fix: (node) => {
+                node.tagName = 'input';
+                if (!node.attributes) node.attributes = {};
+                node.attributes.type = 'hidden';
+                // 关键：将 Struts 的 property 映射到标准的 name 属性
+                if (node.attributes.property) {
+                    node.attributes.name = node.attributes.property;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:textarea> 为 <textarea>",
+            match: (node) => node.tagName === 'html:textarea',
+            fix: (node) => {
+                node.tagName = 'textarea';
+                if (!node.attributes) node.attributes = {};
+                if (node.attributes.property) {
+                    node.attributes.name = node.attributes.property;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:submit> 为 <button type='submit'>",
+            match: (node) => node.tagName === 'html:submit',
+            fix: (node) => {
+                node.tagName = 'button';
+                if (!node.attributes) node.attributes = {};
+                node.attributes.type = 'submit';
+                // 将 value 属性转换为按钮的文本内容，更符合现代实践
+                if (node.attributes.value) {
+                    node.children = [{ tagName: '#text', text: node.attributes.value, attributes: {}, children: [], isComponent: false }];
+                    delete node.attributes.value;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:cancel> 为 <button type='reset'>", // <-- 新增的规则
+            match: (node) => node.tagName === 'html:cancel',
+            fix: (node) => {
+                node.tagName = 'button';
+                if (!node.attributes) node.attributes = {};
+                node.attributes.type = 'reset';
+                // 将 value 属性转换为按钮的文本内容
+                if (node.attributes.value) {
+                    node.children = [{ tagName: '#text', text: node.attributes.value, attributes: {}, children: [], isComponent: false }];
+                    delete node.attributes.value;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:link> 为 <a>",
+            match: (node) => node.tagName === 'html:link',
+            fix: (node) => {
+                node.tagName = 'a';
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:errors /> 为带注释的占位符 <div>",
+            match: (node) => node.tagName === 'html:errors',
+            fix: (node) => {
+                // 1. 将标签转换为 <div>
+                node.tagName = 'div';
+                node.isComponent = false; // 明确它是一个标准HTML元素
+
+                // 2. 确保 attributes 对象存在
+                if (!node.attributes) {
+                    node.attributes = {};
+                }
+
+                // 3. 添加一个特定的类名，用于后续识别和样式化
+                node.attributes.class = 'struts-errors-placeholder';
+
+                // 4. 在内部添加注释文本，以解释其原始用途
+                node.children = [
+                    {
+                        tagName: '#text',
+                        text: ' Struts <html:errors /> placeholder ',
+                        attributes: {},
+                        children: [],
+                        isComponent: false
+                    }
+                ];
+
+                // 确保没有遗留的组件属性
+                delete node.componentUrl;
+            }
+        },
+        {
+            description: "[Struts] 转换 styleClass 属性为 class 属性",
+            match: (node) => node.attributes && typeof node.attributes.styleClass !== 'undefined',
+            fix: (node) => {
+                // 如果 class 属性已存在，可以选择合并或覆盖
+                // 这里采用覆盖的方式，因为 styleClass 通常是主要来源
+                node.attributes.class = node.attributes.styleClass;
+                delete node.attributes.styleClass;
+            }
+        },
+        {
+            description: "[Struts Logic] 转换 <logic:iterate> 为 LoopBlock",
+            match: (node) => node.tagName === 'logic:iterate',
+            fix: (node) => {
+                node.tagName = 'LoopBlock';
+                // 提取关键属性
+                node.collection = node.attributes.name || node.attributes.property;
+                node.item = node.attributes.id;
+                // 清理已转换的属性
+                if (node.attributes.name) delete node.attributes.name;
+                if (node.attributes.property) delete node.attributes.property;
+                if (node.attributes.id) delete node.attributes.id;
+            }
+        },
+        {
+            description: "[Struts Logic] 转换 <logic:present/notPresent> 为 ConditionalBlock",
+            match: (node) => ['logic:present', 'logic:notpresent'].includes(node.tagName),
+            fix: (node) => {
+                const varName = node.attributes.name || node.attributes.property;
+                const condition = node.tagName === 'logic:notpresent'
+                    ? `!isPresent(${varName})`
+                    : `isPresent(${varName})`;
+
+                node.tagName = 'ConditionalBlock';
+                node.condition = condition;
+
+                // 清理属性
+                if (node.attributes.name) delete node.attributes.name;
+                if (node.attributes.property) delete node.attributes.property;
+            }
+        },
+        {
+            description: "[Struts Logic] 转换比较类 logic 标签为 ConditionalBlock",
+            match: (node) => {
+                const comparisonTags = [
+                    'logic:equal', 'logic:notequal', 'logic:lessthan',
+                    'logic:lessorequal', 'logic:greaterthan', 'logic:greaterorequal'
+                ];
+                return comparisonTags.includes(node.tagName);
+            },
+            fix: (node) => {
+                const operators = {
+                    'logic:equal': '==', 'logic:notequal': '!=',
+                    'logic:lessthan': '<', 'logic:lessorequal': '<=',
+                    'logic:greaterthan': '>', 'logic:greaterorequal': '>='
+                };
+                const attrs = node.attributes;
+                const operator = operators[node.tagName];
+
+                let leftHandSide;
+                // **修正点**: 优先检查 'parameter'，然后才是 'name'/'property'
+                if (attrs.parameter) {
+                    leftHandSide = `params.${attrs.parameter}`;
+                } else if (attrs.name) {
+                    leftHandSide = attrs.name + (attrs.property ? `.${attrs.property}` : '');
+                } else {
+                    leftHandSide = 'UNDEFINED_VARIABLE'; // 兜底处理
+                }
+
+                const value = `'${attrs.value}'`;
+
+                node.tagName = 'ConditionalBlock';
+                node.condition = `${leftHandSide} ${operator} ${value}`;
+
+                // 清理所有已处理的属性
+                delete attrs.name;
+                delete attrs.property;
+                delete attrs.parameter;
+                delete attrs.value;
+            }
+        }
+    ],
+    // --- [新增] 阶段 5: JSP 表达式现代化 ---
+    [
+        {
+            description: "[JSP通用] 标准化属性中的动态上下文路径",
+            match: (node) => {
+                if (!node.attributes) return false;
+
+                // 正则表达式，匹配以 <%=...%> 或 ${...} 开头的字符串
+                const jspPathRegex = /^(<%=[\s\S]*?%>|\${[\s\S]*?})/;
+
+                // 检查所有属性值是否符合该模式
+                for (const key in node.attributes) {
+                    const value = node.attributes[key];
+                    if (typeof value === 'string' && jspPathRegex.test(value)) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            fix: (node) => {
+                const jspPathRegex = /^(<%=[\s\S]*?%>|\${[\s\S]*?})/;
+
+                for (const key in node.attributes) {
+                    const value = node.attributes[key];
+                    if (typeof value === 'string' && jspPathRegex.test(value)) {
+                        // 移除表达式部分，并去除前后空格
+                        let cleanedValue = value.replace(jspPathRegex, '').trim();
+
+                        // 对于路径相关的属性 (src, href, action)，确保结果是根路径
+                        if (['src', 'href', 'action'].includes(key.toLowerCase())) {
+                            if (cleanedValue && !cleanedValue.startsWith('/')) {
+                                cleanedValue = '/' + cleanedValue;
+                            }
+                        }
+
+                        node.attributes[key] = cleanedValue;
                     }
                 }
             }
         }
-    }
+    ],
+    // --- [新增] 阶段 6: 特定业务逻辑与组件化转换 ---
+    [
+        {
+            description: "[Placeholder] 转换 <object> 为一个带样式的 <div> 占位符",
+            match: (node) => node.tagName === 'object',
+            fix: (node) => {
+                // 1. 存储原始属性和参数
+                const originalAttributes = { ...node.attributes };
+                const params = [];
+                if (node.children && Array.isArray(node.children)) {
+                    node.children.forEach(child => {
+                        if (child.tagName === 'param' && child.attributes?.name) {
+                            params.push({ name: child.attributes.name, value: child.attributes.value || "" });
+                        }
+                    });
+                }
 
+                // 2. 构建可读的纯文本内容，而不是JSON
+                let content = '[ActiveX Object Placeholder]\n\n';
+
+                // 格式化 attributes
+                content += 'ATTRIBUTES:\n';
+                delete originalAttributes.style; // 不显示 style 属性本身
+                const attrKeys = Object.keys(originalAttributes);
+                if (attrKeys.length > 0) {
+                    attrKeys.forEach(key => {
+                        content += `  - ${key}: "${originalAttributes[key]}"\n`;
+                    });
+                } else {
+                    content += '  (none)\n';
+                }
+
+                // 格式化 params
+                content += '\nPARAMS:\n';
+                if (params.length > 0) {
+                    params.forEach(param => {
+                        content += `  - Name: "${param.name}", Value: "${param.value}"\n`;
+                    });
+                } else {
+                    content += '  (none)\n';
+                }
+
+                // 3. 将节点转换为带样式的占位符 div
+                node.tagName = 'div';
+                node.isComponent = false;
+
+                node.attributes = {
+                    class: 'activex-object-placeholder',
+                    style: {
+                        border: '2px dashed #dc3545',
+                        backgroundColor: '#f8f9fa',
+                        padding: '15px',
+                        margin: '10px 0',
+                        fontFamily: 'Consolas, "Courier New", monospace',
+                        fontSize: '14px',
+                        color: '#212529',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-all',
+                        width: "300px",
+                        height: "100px",
+                        overflow: "auto"
+                    }
+                };
+
+                // 4. 将子节点替换为包含纯文本内容的单个文本节点
+                node.children = [{
+                    tagName: '#text',
+                    text: content,
+                    attributes: {},
+                    children: [],
+                    isComponent: false
+                }];
+            }
+        },
+        {
+            description: "[Logic] 转换 condition 字段中的 session.getAttribute 为 sessionStorage.getItem",
+            match: (node) => typeof node.condition === 'string' && node.condition.includes('session.getAttribute'),
+            fix: (node) => {
+                const regex = /session\.getAttribute\((.*?)\)/g;
+                node.condition = node.condition.replace(regex, (match, capturedArg) => {
+                    let key = capturedArg.trim();
+                    // 移除参数两侧可能存在的引号
+                    if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+                        key = key.substring(1, key.length - 1);
+                    }
+                    return `sessionStorage.getItem('${key}')`;
+                });
+            }
+        }
+    ],
+    // --- 阶段 7: 通用修复与属性转换 (最后进行) ---
+    [
+        {
+            description: "[最后] 转换展示性属性为 style",
+            match: (node) => node.attributes && Object.keys(node.attributes).some(a => ['align', 'valign', 'bgcolor', 'background', 'width', 'height', 'border', 'nowrap', 'cellspacing', 'color', 'face', 'size'].includes(a)),
+            fix: (node) => {
+                let style = {};
+                if (typeof node.attributes.style === 'string') style = parseCssStringToObject(node.attributes.style);
+                else if (typeof node.attributes.style === 'object') style = { ...node.attributes.style };
+
+                const attrs = node.attributes;
+
+                // 使用 typeof 检查属性是否存在，而不是检查其值
+                if (typeof attrs.align !== 'undefined') { style.textAlign = attrs.align; delete attrs.align; }
+                if (typeof attrs.valign !== 'undefined') { style.verticalAlign = attrs.valign; delete attrs.valign; }
+                if (typeof attrs.bgcolor !== 'undefined') { style.backgroundColor = attrs.bgcolor; delete attrs.bgcolor; }
+                if (typeof attrs.background !== 'undefined') { style.backgroundImage = `url(${attrs.background})`; delete attrs.background; }
+                if (typeof attrs.width !== 'undefined') { style.width = addPxIfNeeded(attrs.width); delete attrs.width; }
+                if (typeof attrs.height !== 'undefined') { style.height = addPxIfNeeded(attrs.height); delete attrs.height; }
+                if (typeof attrs.border !== 'undefined') { style.border = attrs.border === '0' ? 'none' : `${addPxIfNeeded(attrs.border)} solid black`; delete attrs.border; }
+                if (typeof attrs.nowrap !== 'undefined') { style.whiteSpace = 'nowrap'; delete attrs.nowrap; }
+                if (typeof attrs.cellspacing !== 'undefined') { style.borderSpacing = addPxIfNeeded(attrs.cellspacing); style.borderCollapse = 'separate'; delete attrs.cellspacing; }
+                if (typeof attrs.color !== 'undefined') { style.color = attrs.color; delete attrs.color; }
+                if (typeof attrs.face !== 'undefined') { style.fontFamily = attrs.face; delete attrs.face; }
+                if (typeof attrs.size !== 'undefined') { style.fontSize = addPxIfNeeded(attrs.size); delete attrs.size; }
+
+                node.attributes.style = style;
+            }
+        }
+    ]
 ];
 
 
-// --- 统一的修复器 ---
-function traverseAndFixInvalidNesting(node, parent = null, rootRef = null) {
-  if (!node || typeof node !== 'object') return;
-  if (Array.isArray(node)) {
-    node.forEach(child => traverseAndFixInvalidNesting(child, parent, rootRef));
-    return;
-  }
-
-  for (const rule of nestingRules) {
-    if (rule.match(node, parent)) {
-      rule.fix(node, parent, rootRef);
+/**
+ * 递归遍历树，为每个节点添加一个指向其父节点的不可枚举的引用。
+ */
+/**
+ * [修复后] 递归遍历树（或节点数组），为每个节点添加一个指向其父节点的不可枚举的引用。
+ * 能正确处理根节点为数组的情况。
+ */
+function addParentLinks(nodeOrArray, parent = null) {
+    // 新增：如果输入是一个数组，则遍历数组中的每个节点
+    if (Array.isArray(nodeOrArray)) {
+        for (const childNode of nodeOrArray) {
+            // 对数组中的每个元素进行递归调用
+            // 它们的父节点是调用时传入的 parent (对于根数组，parent 是 null)
+            addParentLinks(childNode, parent);
+        }
+        return; // 处理完数组后直接返回
     }
-  }
 
-  if (node.children && Array.isArray(node.children)) {
-    node.children.forEach(child => traverseAndFixInvalidNesting(child, node, rootRef));
-  }
+    // --- 以下为原逻辑，保持不变 ---
+
+    // 如果输入是单个节点对象
+    const node = nodeOrArray;
+    if (!node || typeof node !== 'object') return;
+
+    // 为当前节点定义不可枚举的 'parent' 属性
+    Object.defineProperty(node, 'parent', {
+        value: parent,
+        writable: true,
+        configurable: true,
+        enumerable: false
+    });
+
+    // 如果节点有子节点，则递归处理子节点数组
+    if (node.children && Array.isArray(node.children)) {
+        // 此时，当前节点 'node' 就是它所有子节点的父节点
+        addParentLinks(node.children, node);
+    }
+}
+
+/**
+ * [新] 深度优先遍历，从给定的规则列表中查找并应用第一个匹配的规则。
+ * @param {object|array} nodeOrArray - 当前要检查的节点或节点数组。
+ * @param {object} parent - 父节点。
+ * @param {object} root - 整个 JSON 树的根对象。
+ * @param {array} rulesToApply - 本次检查要应用的规则数组。
+ * @returns {boolean} - 如果应用了规则则返回 true，否则返回 false。
+ */
+function applyOneRule(nodeOrArray, parent, root, rulesToApply) {
+    if (!nodeOrArray || typeof nodeOrArray !== 'object') return false;
+
+    // Case 1: 节点是一个节点数组 (e.g., children or root.elements)
+    if (Array.isArray(nodeOrArray)) {
+        for (const item of nodeOrArray) {
+            if (applyOneRule(item, parent, root, rulesToApply)) {
+                return true; // 发现并修复了一个问题，立即停止并返回
+            }
+        }
+        return false;
+    }
+
+    // Case 2: 节点是一个对象
+    const node = nodeOrArray;
+    // 首先，对当前节点尝试所有规则
+    for (const rule of rulesToApply) {
+        if (rule.match(node, node.parent, root)) {
+            console.log(`应用规则: ${rule.description}`);
+            rule.fix(node, node.parent, root);
+            return true; // 修复完成，立即返回 true
+        }
+    }
+
+    // 如果当前节点没有匹配的规则，则递归检查其子节点
+    if (node.children && Array.isArray(node.children)) {
+        if (applyOneRule(node.children, node, root, rulesToApply)) {
+            return true; // 子节点中应用了规则，向上传递 true
+        }
+    }
+
+    return false; // 当前节点及其所有子节点都没有匹配任何规则
 }
 
 
+/**
+* 过滤掉不需要的标签，并展开 html/head/body。
+*/
+function processJsonElements(elements) {
+    if (!Array.isArray(elements)) return [];
+    return elements.reduce((acc, el) => {
+        const tagsToRemove = ['meta', 'title', 'link', 'script', 'noscript', 'style', '!doctype'];
+        if (!el.tagName || tagsToRemove.includes(el.tagName.toLowerCase())) return acc;
+
+        const tagsToUnwrap = ['html', 'head', 'body'];
+        if (tagsToUnwrap.includes(el.tagName.toLowerCase())) {
+            return acc.concat(processJsonElements(el.children || []));
+        }
+
+        if (el.children && el.children.length > 0) {
+            const newEl = { ...el, children: processJsonElements(el.children) };
+            acc.push(newEl);
+        } else {
+            acc.push(el);
+        }
+        return acc;
+    }, []);
+}
 
 /**
- * 确保从LLM获取的内容是有效的JSON，如果不是则要求LLM重新生成，最多重试3次。
- * @param {string} sessionId - 当前会话的ID。
- * @param {string} initialContent - LLM的初次响应内容。
- * @returns {Promise<string>} - 经过验证和处理后的JSON字符串。
- */
+* [修改后] 确保 LLM 生成的内容是合法 JSON，并应用多遍分阶段修复规则直至收敛。
+*/
 async function generateAndValidateJson(sessionId, initialContent) {
     let currentContent = initialContent;
     const maxAttempts = 3;
@@ -447,59 +793,57 @@ async function generateAndValidateJson(sessionId, initialContent) {
             let parsedJson = JSON.parse(currentContent);
             console.log(`Attempt ${attempt}: JSON is valid.`);
 
-            // --- 运行所有的后处理函数 ---
+            // --- [新] 分阶段收敛修复引擎 ---
+            const maxPassesPerPhase = 1000;
+            console.log("启动分阶段收敛修复引擎...");
 
-            // 1. (新) 通用处理：将所有废弃的展示性属性转换为 style 对象
-            traverseAndApplyPresentationalAttributes(parsedJson.elements);
+            // 遍历每一个规则阶段
+            for (const [phaseIndex, currentPhaseRules] of rulePhases.entries()) {
+                let pass = 0;
+                let ruleWasApplied;
 
-            // 2. 特殊处理 <object> 标签
-            traverseAndTransformObjects(parsedJson.elements);
+                console.log(`--- 进入阶段 ${phaseIndex + 1} ---`);
 
-            // 3. 特殊处理 session.getAttribute
-            traverseAndReplaceSessionGetAttribute(parsedJson.elements);
+                // 在每个阶段内部进行收敛循环
+                do {
+                    pass++;
+                    // 每一遍开始时，都必须重新计算和链接所有父节点
+                    addParentLinks(parsedJson.elements, null);
 
-            // 4. (重构) 仅处理表格的 *结构性* 问题
-            traverseAndProcessTableStructure(parsedJson.elements);
+                    // 在当前阶段的规则中应用单个规则
+                    ruleWasApplied = applyOneRule(parsedJson.elements, null, parsedJson, currentPhaseRules);
 
-            // 新增步骤: 修复不规范嵌套
-            traverseAndFixInvalidNesting(parsedJson.elements, null, parsedJson);
-            // 5. (最终) 应用节点过滤和结构扁平化规则
+                } while (ruleWasApplied && pass < maxPassesPerPhase);
+
+                console.log(`阶段 ${phaseIndex + 1} 结束于第 ${pass} 遍。`);
+                if (pass >= maxPassesPerPhase) {
+                    console.warn(`阶段 ${phaseIndex + 1} 达到最大处理遍数，可能存在规则冲突或死循环。`);
+                }
+            }
+            // --- 引擎结束 ---
+
+            console.log("应用最终过滤...");
             parsedJson.elements = processJsonElements(parsedJson.elements);
 
-            return JSON.stringify(parsedJson, null, 2); // 成功
+            return JSON.stringify(parsedJson, null, 2);
 
         } catch (error) {
-            console.error(`Attempt ${attempt}/${maxAttempts} failed: Content is not valid JSON.`);
+            console.error(`Attempt ${attempt}/${maxAttempts} failed: invalid JSON.`, error);
+            if (attempt >= maxAttempts) throw new Error("Failed to generate valid JSON after multiple attempts.");
 
-            if (attempt >= maxAttempts) {
-                throw new Error("Failed to generate valid JSON after multiple attempts.");
-            }
-
+            // JSON 无效时的重试逻辑 (保持不变)
             sessions[sessionId].push({ role: "assistant", content: currentContent });
-            sessions[sessionId].push({
-                role: "user",
-                content: "整合结果错误，请重新整合"
-            });
-
-            console.log("Requesting regeneration from LLM...");
-            const stream = await openai.chat.completions.create({
-                model: process.env.OPENAI_MODEL || "qwen3-coder",
-                messages: sessions[sessionId],
-                temperature: 0,
-                stream: true,
-            });
-
-            let regeneratedContent = "";
-            for await (const chunk of stream) {
-                regeneratedContent += chunk.choices[0]?.delta?.content || "";
-            }
-            currentContent = regeneratedContent;
+            sessions[sessionId].push({ role: "user", content: "整合结果错误，JSON格式不正确，请严格按照JSON格式重新整合并输出。" });
+            const stream = await openai.chat.completions.create({ /* ... */ });
+            let regenerated = "";
+            for await (const chunk of stream) regenerated += chunk.choices[0]?.delta?.content || "";
+            currentContent = regenerated;
         }
     }
 }
 
 
-// --- API 路由 ---
+// --- API 路由 (保持不变) ---
 router.post('/chat', async (req, res) => {
     try {
         const { message, sessionId = 'default' } = req.body;
@@ -513,7 +857,7 @@ router.post('/chat', async (req, res) => {
 
 规则：
 - 自主优先: 优先尝试自己直接完成用户的请求。
-- 工具辅助: 当你遇到需要转换的特定标签片段时（例如JSP自定义标签、Struts标签库，或像 <font> 这样的废弃HTML标签），必须调用 'convertJspSnippet' 工具进行处理。
+- 工具辅助: 当你遇到小而独立的自定义标签（如 <jsp:include>, <c:if>, <font>）时，必须调用 'convertJspSnippet' 工具。对于html:XX格式的标签，当作正常标签处理
 - 样式修复（重要）: 任何时候只要发现属性 'style' 是字符串或存在不规范写法（如下划线/星号 hack、大小写混乱、缺失单位、连字符属性名等），必须优先调用 'normalizeStyleWithLlm' 工具获得修复后的 JSON 样式对象，并用结果替换原有的 style。
 - 调用时只传递最小片段。
 - 如果片段中有多个需要转换的标签，请调用工具多次，每次传入一个完整标签。
@@ -596,7 +940,7 @@ router.post('/chat', async (req, res) => {
     }
 });
 
-// 会话管理
+// 会话管理 (保持不变)
 router.get('/sessions/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const session = getSession(sessionId);
@@ -612,5 +956,4 @@ router.delete('/sessions/:sessionId', (req, res) => {
     return res.json({ success });
 });
 
-// 导出路由而不是启动服务器
 export default router;

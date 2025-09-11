@@ -52,9 +52,9 @@ function convertJspInclude(snippet) {
     let componentUrl;
     if (pageAttr.startsWith("/")) {
         const dir = pageAttr.split("/").slice(0, -1).join("/");
-        componentUrl = `@/pages${dir}/${componentName}.jsx`;
+        componentUrl = `@/pages${dir}/${componentName}`;
     } else {
-        componentUrl = `./${componentName}.jsx`;
+        componentUrl = `./${componentName}`;
     }
 
     return JSON.stringify({
@@ -77,45 +77,8 @@ function convertJspInclude(snippet) {
  */
 const promptRegistry = {
     "jsp:include": {
-        systemPrompt: `你是一个精通JSP到JSON转换的专家级程序员。你的任务是严格按照用户提供的规则，将JSP代码片段转换为指定的JSON对象，并且只输出纯粹的JSON结果。`,
-        userPromptTemplate: (content) => `
-**任务:** 将给定的JSP代码片段精确地转换为指定的JSON格式。
-
-**转换规则:**
-1.  **tagName**:
-    *   根据其 \`page\` 属性生成组件名（首字母大写）。
-2.  **attributes**:
-    *   将JSP标签的所有属性（**除了 \`page\` 属性**）转换为一个键值对，作为 \`attributes\` 对象的值。\`page\` 属性仅用于生成组件名和路径，不应出现在最终的 attributes 中。
-    *   **特殊处理**: 如果属性名为 \`style\`，其值（例如 \`"color:red; font-size:14px"\`）必须被解析成一个CSS-in-JS风格的JSON对象（例如 \`{"color":"red", "fontSize":"14px"}\`）。
-3.  **isComponent**: 始终为 \`true\`。
-4.  **componentUrl (重要路径规则)**:
-    *   其值由 \`page\` 属性的路径决定：
-        *   如果 \`page\` 属性以 \`/\` 开头 (例如 \`page="/admin/user.jsp"\`)，则 URL 为 \`"@/pages"\` + \`page\` 属性的路径（去掉文件名） + 转换后的组件名 + \`.jsx\`。示例: \`"@/pages/admin/User.jsx"\`。
-        *   如果 \`page\` 属性不以 \`/\` 开头 (例如 \`page="header.jsp"\`)，则 URL 为 \`"./"\` + 转换后的组件名 + \`.jsx\`。示例: \`"./Header.jsx"\`。
-5.  **condition**: 如果JSP标签被包含在逻辑判断中，则提取该判断条件；否则，此字段为空字符串 \`""\`。
-6.  **children**: 如果标签内有子标签，则递归地将它们转换为JSON对象并放入此数组；否则，数组为空 \`[]\`。
-7.  **特殊处理 \`<jsp:param>\`**: 此标签自身不被转换为独立的JSON对象。它的 \`name\` 和 \`value\` 属性应该被提取出来，作为键值对直接添加到其父级标签的 \`attributes\` 对象中。
-
-**输出要求:**
-- 严格按照规则输出JSON。
-- 不要输出任何介绍、解释、注释或markdown代码块标记。
-- 只输出纯粹的、可以直接被JavaScript的 \`JSON.parse()\` 方法解析的JSON对象字符串。
-
----
-
-**示例:**
-输入 JSP: <jsp:include page="/components/common/header.jsp" id="header" />
-输出 JSON: {"tagName":"Header","attributes":{"id":"header"},"isComponent":true,"componentUrl":"@/pages/components/common/Header.jsx","children":[]}
-
----
-
-**现在，请根据以上所有规则，转换以下JSP代码:**
-
-**输入 JSP 代码:**
-\`\`\`jsp
-${content}
-\`\`\`
-`
+        systemPrompt: ``,
+        userPromptTemplate: (content) => ""
     },
     "c:if": {
         systemPrompt: `你是一个专门处理JSTL c:if 标签的专家。你的任务是将 c:if 标签及其内容转换为一个特定的JSON结构，用于表示条件渲染。`,
@@ -129,61 +92,6 @@ ${content}
 
 ---
 **现在，请转换以下JSP代码:**
-\`\`\`jsp
-${content}
-\`\`\`
-`
-    },
-    "html": {
-        systemPrompt: `你是一位精通JSP、Struts 1，并且深刻理解如何将旧版代码迁移到现代React框架的专家级前端架构师。你的任务是将Struts的 'html' 标签库转换为一个“React友好”的JSON中间表示（IR）。`,
-        userPromptTemplate: (content) => `
-**任务:** 将给定的 Struts 'html' 标签库代码片段，转换为一个旨在最终生成 React JSX 的、结构清晰的JSON对象。
-
-**核心转换理念:**
-你转换的目标不是1:1的字面翻译，而是要捕捉其“意图”，并将其映射到现代HTML5和React的最佳实践上。
-
-**通用转换规则:**
-1.  **tagName**: 将 Struts 标签转换为其最语义化的、现代小写 HTML5 标签名。
-2.  **attributes**:
-    *   迁移所有标准 HTML 属性（如 \`class\`, \`id\`, \`onclick\` 等）。
-    *   **Style属性**: 将 \`style\` 字符串 (\`"width:100px; color:red"\`) 解析为 React 的内联样式对象 (\`{"width":"100px", "color":"red"}\`)。
-    *   **Property属性 (关键)**: Struts 的 \`property\` 属性用于数据绑定。为了适配React的状态管理，它的值**必须**被映射到标准的 \`name\` 属性上。同时保留原始的 \`property\` 属性用于追溯。
-3.  **isComponent**: 对于所有由 Struts 'html' 标签转换而来的元素，此值始终为 \`false\`。
-4.  **children**: 递归处理所有子节点。
-    * 如果子节点是普通标签，按规则继续转换。
-    * 如果子节点是纯文本（例如 \`<html:link>Click</html:link>\` 里的 \`Click\`），必须转换为一个对象：
-      \`\`\`json
-      {"tagName":"#text","text":"Click","attributes":{},"children":[],"isComponent":false}
-      \`\`\`
-
-**特定标签映射规则 (React-aware):**
-*   \`<html:form action="...">\` 转换为 \`{"tagName": "form", ...}\`。
-*   \`<html:text property="user" />\` 转换为 \`{"tagName": "input", "attributes": {"type": "text", "property": "user", "name": "user"}}\`。
-*   \`<html:password property="pass" />\` 转换为 \`{"tagName": "input", "attributes": {"type": "password", "property": "pass", "name": "pass"}}\`。
-*   \`<html:textarea property="desc" />\` 转换为 \`{"tagName": "textarea", "attributes": {"property": "desc", "name": "desc"}}\`。
-*   \`<html:submit value="Login" />\` 转换为 \`{"tagName": "button", "attributes": {"type": "submit"}, "text": "Login"}\` (使用 \`<button>\` 更灵活)。
-*   \`<html:link href="/p">Go</html:link>\` 转换为 \`{"tagName": "a", "attributes": {"href": "/p"}, "text": "Go"}\`。
-*   **\`<html:errors />\` (新规则): 这是一个占位符。将其转换为一个带有特定类名的空 \`<div>\`，并在内部添加注释文本。**
-
-**输出要求:**
-- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
-- 绝不输出任何解释、注释或Markdown代码块标记。
-
----
-
-**示例 1: 包含数据绑定的输入框**
-输入 JSP: <html:text property="username" style="width:200px;" maxlength="50" />
-输出 JSON: {"tagName":"input","attributes":{"type":"text","property":"username","name":"username","style":{"width":"200px"},"maxlength":"50"},"children":[],"isComponent":false}
-
-**示例 2: 表单和错误占位符**
-输入 JSP: <html:form action="/login.do"><html:errors/><html:submit value="Login"/></html:form>
-输出 JSON: {"tagName":"form","attributes":{"action":"/login.do"},"children":[{"tagName":"FormErrors","attributes":{},"children":[],"isComponent":false},{"tagName":"button","attributes":{"type":"submit"},"children":[],"isComponent":false,"text":"Login"}],"isComponent":false}
-
----
-
-**现在，请根据以上所有规则，转换以下JSP代码:**
-
-**输入 JSP 代码:**
 \`\`\`jsp
 ${content}
 \`\`\`
@@ -230,85 +138,6 @@ ${content}
 **示例 2: 只有颜色**
 输入 JSP: <font color="#FF0000">错误信息</font>
 输出 JSON: {"tagName":"span","attributes":{"style":{"color":"#FF0000"}},"children":[],"isComponent":false,"text":"错误信息"}
-
----
-
-**现在，请根据以上所有规则，转换以下JSP代码:**
-
-**输入 JSP 代码:**
-\`\`\`jsp
-${content}
-\`\`\`
-`
-    },
-    // --- 【新增】: 支持 Struts 'logic' 标签库 ---
-    "logic": {
-        systemPrompt: `你是一位精通 Struts 1 'logic' 标签库的专家，任务是将这些旧版的逻辑控制标签，转换为一个现代前端框架（如 React）能够理解的、结构化的 JSON 中间表示（IR）。`,
-        userPromptTemplate: (content) => `
-**任务:** 将给定的 Struts 'logic' 标签库代码片段，转换为一个能清晰表达其“循环”或“条件”意图的JSON对象。
-
-**核心转换理念:**
-捕捉 Struts 'logic' 标签的本质功能——迭代和条件渲染，并用一个通用的、与具体实现无关的JSON结构来表示它。
-
-**特定标签映射规则:**
-
-1.  **\`<logic:iterate>\` (循环)**:
-    *   **tagName**: 固定为字符串 \`"LoopBlock"\`。
-    *   **collection**: 提取 \`name\` 或 \`property\` 属性的值，它代表要迭代的集合的名称。
-    *   **item**: 提取 \`id\` 属性的值，它代表循环中每个元素的变量名。
-    *   **children**: 递归处理 \`<logic:iterate>\` 标签内部的所有子节点，并将结果放入此数组。
-
-2.  **条件标签 (如 \`<logic:equal>\`, \`<logic:notEqual>\`, \`<logic:present>\` 等)**:
-    *   **tagName**: 固定为字符串 \`"ConditionalBlock"\`。
-    *   **condition**: 将标签的意图和属性组合成一个易于理解的条件表达式字符串。
-        *   \`<logic:equal name="user" property="role" value="admin">\` -> \`"user.role == 'admin'"\`
-        *   \`<logic:notEqual name="status" value="0">\` -> \`"status != '0'"\`
-        *   \`<logic:present name="user">\` -> \`"isPresent(user)"\`
-        *   \`<logic:notPresent name="user">\` -> \`"!isPresent(user)"\`
-        *   \`<logic:greaterThan name="count" value="10">\` -> \`"count > 10"\`
-    *   **children**: 递归处理条件标签内部的所有子节点。
-
-**输出要求:**
-- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
-- 绝不输出任何解释、注释或Markdown代码块标记。
-
----
-
-**示例 1: 循环标签**
-输入 JSP:
-\`\`\`jsp
-<logic:iterate id="item" name="userList">
-  <p>用户名: <bean:write name="item" property="name" /></p>
-</logic:iterate>
-\`\`\`
-输出 JSON:
-\`\`\`json
-{"tagName":"LoopBlock","collection":"userList","item":"item","children":[{"tagName":"p","attributes":{},"children":[],"isComponent":false,"text":"用户名: <bean:write name=\\"item\\" property=\\"name\\" />"}]}
-\`\`\`
-
-**示例 2: 条件标签**
-输入 JSP:
-\`\`\`jsp
-<logic:equal name="user" property="role" value="admin">
-  <a href="/admin">管理后台</a>
-</logic:equal>
-\`\`\`
-输出 JSON:
-\`\`\`json
-{"tagName":"ConditionalBlock","condition":"user.role == 'admin'","children":[{"tagName":"a","attributes":{"href":"/admin"},"children":[],"isComponent":false,"text":"管理后台"}]}
-\`\`\`
-
-**示例 3: 存在性判断**
-输入 JSP:
-\`\`\`jsp
-<logic:present name="errorMessages">
-  <div class="error">请修正错误</div>
-</logic:present>
-\`\`\`
-输出 JSON:
-\`\`\`json
-{"tagName":"ConditionalBlock","condition":"isPresent(errorMessages)","children":[{"tagName":"div","attributes":{"class":"error"},"children":[],"isComponent":false,"text":"请修正错误"}]}
-\`\`\`
 
 ---
 
@@ -597,13 +426,13 @@ export const tools = [
         type: "function",
         function: {
             name: "convertJspSnippet", // 新的、更通用的函数名
-            description: "当需要将一小段特定的标签片段转换为JSON结构时调用此工具。特别适用于处理JSP自定义标签（如 <jsp:include>, <c:if>），Struts标签库（如 <html:text>, <logic:iterate>），以及需要现代化的、已废弃的HTML标签（如 <font>, <frameset>）。",
+            description: "当需要将一小段特定的标签片段转换为JSON结构时调用此工具。特别适用于处理JSP自定义标签（如 <jsp:include>, <c:if>），以及需要现代化的、已废弃的HTML标签（如 <font>, <frameset>）。",
             parameters: {
                 type: "object",
                 properties: {
                     content: {
                         type: "string",
-                        description: "需要转换的、完整的JSP代码片段。例如：'<logic:iterate id=\"item\" name=\"userList\"><p>{item.name}</p></logic:iterate>' 或 '<frameset rows=\"0,*\"><frame src=\"page.jsp\"></frameset>'"
+                        description: "需要转换的、完整的JSP代码片段。例如：'<frameset rows=\"0,*\"><frame src=\"page.jsp\"></frameset>'"
                     }
                 },
                 required: ["content"]
