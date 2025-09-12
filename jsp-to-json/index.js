@@ -54,7 +54,10 @@ const rulePhases = [
     [
         {
             description: "[预处理] 转换 tagName 为小写",
-            match: (node) => typeof node.tagName === 'string' && !node.isComponent && node.tagName !== node.tagName.toLowerCase(),
+            match: (node) => typeof node.tagName === 'string' &&
+                node.tagName !== 'ConditionalBlock' && node.tagName !== 'LoopBlock' && // <-- 修改点: 增加此条件，防止 ConditionalBlock 被转为小写
+                !node.isComponent &&
+                node.tagName !== node.tagName.toLowerCase(),
             fix: (node) => { node.tagName = node.tagName.toLowerCase(); }
         }
     ],
@@ -195,7 +198,9 @@ const rulePhases = [
         },
         {
             description: "[语义] <tbody> 下的非法子元素",
-            match: (node, parent) => parent?.tagName === 'tbody' && node.tagName !== 'tr',
+            match: (node, parent) => parent?.tagName === 'tbody' &&
+                node.tagName !== 'tr' &&
+                node.tagName !== 'ConditionalBlock', // <-- 修改点: 增加此条件，不处理 ConditionalBlock
             fix: (node, parent) => {
                 const idx = parent.children.indexOf(node);
                 if (idx !== -1) {
@@ -207,7 +212,10 @@ const rulePhases = [
         },
         {
             description: "[语义] <tr> 下的非法子元素",
-            match: (node, parent) => parent?.tagName === 'tr' && node.tagName !== 'td' && node.tagName !== 'th',
+            match: (node, parent) => parent?.tagName === 'tr' &&
+                node.tagName !== 'td' &&
+                node.tagName !== 'th' &&
+                node.tagName !== 'ConditionalBlock', // <-- 修改点: 增加此条件，不处理 ConditionalBlock
             fix: (node, parent) => {
                 const idx = parent.children.indexOf(node);
                 if (idx !== -1) {
@@ -218,8 +226,14 @@ const rulePhases = [
         },
         {
             description: "[孤立] 修复孤立的 <td> 或 <th>",
-            match: (node, parent) => (node.tagName === 'td' || node.tagName === 'th') && parent?.tagName !== 'tr',
+            match: (node, parent) => {
+                if ((node.tagName === 'td' || node.tagName === 'th') && !node._wrapped) {
+                    return parent?.tagName !== 'tr';
+                }
+                return false;
+            },
             fix: (node, parent, root) => {
+                node._wrapped = true; // 给 td/th 打标记
                 const wrapperTr = { tagName: 'tr', attributes: {}, children: [node] };
                 const wrapperTbody = { tagName: 'tbody', attributes: {}, children: [wrapperTr] };
                 const wrapperTable = { tagName: 'table', attributes: {}, children: [wrapperTbody] };
@@ -230,8 +244,23 @@ const rulePhases = [
         },
         {
             description: "[孤立] 修复孤立的 <tr>",
-            match: (node, parent) => node.tagName === 'tr' && !['tbody', 'thead', 'tfoot'].includes(parent?.tagName),
+            match: (node, parent) => {
+                if (node.tagName !== 'tr' || node._wrapped) return false;
+
+                if (['tbody', 'thead', 'tfoot'].includes(parent?.tagName)) return false;
+                if (parent && parent.condition !== undefined && parent.children && parent.parent?.tagName === 'ConditionalBlock') return false;
+                if (parent?.tagName === 'ConditionalBlock' || parent?.tagName === 'LoopBlock') {
+                    const grandParent = parent.parent;
+                    if (['tbody', 'thead', 'tfoot'].includes(grandParent?.tagName)) return false;
+                }
+                if (parent?.condition && parent?.children && parent?.parent?.tagName === 'ConditionalBlock') {
+                    const grandParent = parent.parent.parent;
+                    if (['tbody', 'thead', 'tfoot'].includes(grandParent?.tagName)) return false;
+                }
+                return true;
+            },
             fix: (node, parent, root) => {
+                node._wrapped = true; // 给 tr 打标记
                 const wrapperTbody = { tagName: 'tbody', attributes: {}, children: [node] };
                 const wrapperTable = { tagName: 'table', attributes: {}, children: [wrapperTbody] };
                 const container = parent ? parent.children : root.elements;
@@ -427,6 +456,30 @@ const rulePhases = [
 
                 // 确保没有遗留的组件属性
                 delete node.componentUrl;
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:select> 为 <select>",
+            match: (node) => node.tagName === 'html:select',
+            fix: (node) => {
+                node.tagName = 'select';
+                if (!node.attributes) node.attributes = {};
+                if (node.attributes.property) {
+                    node.attributes.name = node.attributes.property;
+                    delete node.attributes.property;
+                }
+            }
+        },
+        {
+            description: "[Struts] 转换 <html:option> 为 <option>",
+            match: (node) => node.tagName === 'html:option',
+            fix: (node) => {
+                node.tagName = 'option';
+                if (!node.attributes) node.attributes = {};
+                // 保留 value
+                if (node.attributes.value) {
+                    node.attributes.value = node.attributes.value;
+                }
             }
         },
         {
@@ -715,7 +768,7 @@ function addParentLinks(nodeOrArray, parent = null) {
 }
 
 /**
- * [新] 深度优先遍历，从给定的规则列表中查找并应用第一个匹配的规则。
+ * [修改后] 深度优先遍历，从给定的规则列表中查找并应用第一个匹配的规则。
  * @param {object|array} nodeOrArray - 当前要检查的节点或节点数组。
  * @param {object} parent - 父节点。
  * @param {object} root - 整个 JSON 树的根对象。
@@ -746,12 +799,33 @@ function applyOneRule(nodeOrArray, parent, root, rulesToApply) {
         }
     }
 
-    // 如果当前节点没有匹配的规则，则递归检查其子节点
+    // --- [修改点] 开始 ---
+    // 如果当前节点是 ConditionalBlock，则递归检查其每个分支的子节点
+    if (node.tagName === 'ConditionalBlock' && Array.isArray(node.branches)) {
+        for (const branch of node.branches) {
+            // 注意：每个 branch 成为其 children 的父节点
+            if (branch.children && applyOneRule(branch.children, branch, root, rulesToApply)) {
+                return true; // 分支中应用了规则，向上传递 true
+            }
+        }
+    }
+    // --- [修改点] 结束 ---
+
+
+    // 如果当前节点没有匹配的规则，则递归检查其子节点 (原逻辑保持不变)
     if (node.children && Array.isArray(node.children)) {
         if (applyOneRule(node.children, node, root, rulesToApply)) {
             return true; // 子节点中应用了规则，向上传递 true
         }
     }
+
+    // 始终处理 ConditionalBlock 的 branches
+    if (node.tagName === 'ConditionalBlock' && Array.isArray(node.branches)) {
+        for (const branch of node.branches) {
+            if (applyOneRule(branch.children, branch, root, rulesToApply)) return true;
+        }
+    }
+
 
     return false; // 当前节点及其所有子节点都没有匹配任何规则
 }
@@ -771,7 +845,16 @@ function processJsonElements(elements) {
             return acc.concat(processJsonElements(el.children || []));
         }
 
-        if (el.children && el.children.length > 0) {
+        // --- 新增修复逻辑 ---
+        if (el.tagName === 'ConditionalBlock' && Array.isArray(el.branches)) {
+            // 遍历所有分支，并对每个分支的 children 进行递归处理
+            const newBranches = el.branches.map(branch => ({
+                ...branch,
+                children: processJsonElements(branch.children || [])
+            }));
+            const newEl = { ...el, branches: newBranches };
+            acc.push(newEl);
+        } else if (el.children && el.children.length > 0) { // 原有逻辑
             const newEl = { ...el, children: processJsonElements(el.children) };
             acc.push(newEl);
         } else {
@@ -785,7 +868,28 @@ function processJsonElements(elements) {
 * [修改后] 确保 LLM 生成的内容是合法 JSON，并应用多遍分阶段修复规则直至收敛。
 */
 async function generateAndValidateJson(sessionId, initialContent) {
-    let currentContent = initialContent;
+        // 定义一个内部函数，用于从可能包含 Markdown 标记的字符串中提取纯 JSON 文本。
+    const extractJsonFromString = (text) => {
+        // 如果输入不是字符串（例如 null 或 undefined），返回一个空的 JSON 对象字符串以避免后续错误。
+        if (typeof text !== 'string') {
+            return '{}';
+        }
+        
+        // 使用正则表达式匹配 ```json ... ``` 或 ``` ... ``` 代码块。
+        // [\s\S]*? 能够匹配包括换行符在内的任何字符（非贪婪模式）。
+        const regex = /```(?:json)?\s*([\s\S]*?)\s*```/;
+        const match = text.match(regex);
+
+        // 如果匹配成功，返回捕获组（即代码块内的内容），并去除首尾空格。
+        if (match && match[1]) {
+            return match[1].trim();
+        }
+
+        // 如果没有找到 Markdown 代码块，直接返回原始文本并去除首尾空格。
+        // 这可以处理模型直接返回纯 JSON 字符串的情况。
+        return text.trim();
+    };
+    let currentContent = extractJsonFromString(initialContent);;
     const maxAttempts = 3;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -853,19 +957,163 @@ router.post('/chat', async (req, res) => {
             return res.status(400).json({ error: '消息不能为空' });
         }
 
-        initializeSession(sessionId, `你是一位专业的AI代码助手。你的核心任务是根据用户的需求，独立完成代码的编写、重构或解释，并始终以一个完整的JSON对象作为最终输出。
+        initializeSession(sessionId, `你是一位精通将旧版 JSP/Struts 代码转换为现代化 JSON 结构的 AI 专家。你的核心任务是将用户提供的代码片段，严格按照下面提供的 JSON Schema 格式，转换成一个唯一的、完整的、合法的 JSON 对象。
 
-规则：
-- 自主优先: 优先尝试自己直接完成用户的请求。
-- 工具辅助: 当你遇到小而独立的自定义标签（如 <jsp:include>, <c:if>, <font>）时，必须调用 'convertJspSnippet' 工具。对于html:XX格式的标签，当作正常标签处理
-- 样式修复（重要）: 任何时候只要发现属性 'style' 是字符串或存在不规范写法（如下划线/星号 hack、大小写混乱、缺失单位、连字符属性名等），必须优先调用 'normalizeStyleWithLlm' 工具获得修复后的 JSON 样式对象，并用结果替换原有的 style。
-- 调用时只传递最小片段。
-- 如果片段中有多个需要转换的标签，请调用工具多次，每次传入一个完整标签。
-- 合并工作流:
-   a. 在代码中插入 <!--MCP_TOOL_RESULT_HERE--> 占位符。
-   b. 发起工具调用。
-   c. 收到结果后整合，输出完整代码。
-- 输出格式：最终的、完整的响应必须是一个JSON对象，没有任何其他文本或解释。`);
+### 核心要求：输出格式必须严格遵守以下 JSON Schema
+\`\`\`json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JSP Page Structure Schema (with ConditionalBlock and LoopBlock)",
+  "description": "一个用于描述已解析的 JSP 页面结构的 JSON Schema，支持使用 ConditionalBlock 处理条件逻辑和 LoopBlock 处理循环逻辑。",
+  "type": "object",
+  "properties": {
+    "variable": {
+        "type": "object",
+        "description": "存储页面中定义的变量及其类型",
+        "additionalProperties": {
+            "type": "string",
+            "enum": ["string", "number", "boolean", "object", "null", "undefined"]
+        }
+    },
+    "links": { "type": "array", "items": { "type": "string", "format": "uri-reference" } },
+    "style": {
+        "type": "object",
+        "description": "CSS选择器作为键，样式对象作为值。",
+        "additionalProperties": {
+            "type": "object",
+            "description": "CSS属性作为键，值作为字符串。",
+            "additionalProperties": { "type": "string" }
+        }
+    },
+    "elements": { "type": "array", "items": { "$ref": "#/definitions/element" } }
+  },
+  "required": [ "variable", "links", "style", "elements" ],
+  "definitions": {
+    "element": {
+      "oneOf": [
+        { "$ref": "#/definitions/standardNode" },
+        { "$ref": "#/definitions/conditionalBlockNode" },
+        { "$ref": "#/definitions/loopBlockNode" }
+      ]
+    },
+    "standardNode": {
+      "type": "object",
+      "properties": {
+        "tagName": { "type": "string", "not": { "enum": ["ConditionalBlock", "LoopBlock"] } },
+        "text": { "type": "string" },
+        "attributes": {
+          "type": "object",
+          "properties": { "style": { "type": "object", "additionalProperties": { "type": "string" } } },
+          "additionalProperties": { "type": "string" }
+        },
+        "condition": { "type": "string" },
+        "children": { "type": "array", "items": { "$ref": "#/definitions/element" } },
+        "isComponent": { "type": "boolean", "default": false },
+        "componentUrl": { "type": "string", "format": "uri-reference" }
+      },
+      "required": [ "tagName", "attributes", "children", "isComponent" ]
+    },
+    "conditionalBlockNode": {
+      "type": "object",
+      "properties": {
+        "tagName": { "const": "ConditionalBlock" },
+        "branches": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/branch" } }
+      },
+      "required": [ "tagName", "branches" ]
+    },
+    "branch": {
+      "type": "object",
+      "properties": {
+        "condition": { "type": "string" },
+        "children": { "type": "array", "items": { "$ref": "#/definitions/element" } }
+      },
+      "required": [ "condition", "children" ]
+    },
+    "loopBlockNode": {
+      "type": "object",
+      "properties": {
+        "tagName": { "const": "LoopBlock" },
+        "collection": { "type": "string" },
+        "item": { "type": "string" },
+        "children": { "type": "array", "items": { "$ref": "#/definitions/element" } }
+      },
+      "required": [ "tagName", "collection", "item", "children" ]
+    }
+  }
+}
+\`\`\`
+
+### 关键结构说明
+1.  **顶层结构**: 最终输出必须是包含 \`variable\`, \`links\`, \`style\`, \`elements\` 四个键的根对象。
+2.  **条件逻辑 (ConditionalBlock)**: 任何 if/else 逻辑（如 \`<logic:present>\`, \`<c:if>\`）都必须转换为 \`ConditionalBlock\` 结构。
+    -   \`tagName\` 固定为 \`"ConditionalBlock"\`。
+    -   包含一个 \`branches\` 数组，数组中每个对象代表一个分支 (\`if\`, \`else if\`, \`else\`)。
+    -   每个分支都有 \`condition\` 字符串和 \`children\` 数组。
+    -   **\`else\` 分支的 \`condition\` 必须是字符串 \`'true'\`**。
+
+3.  **循环逻辑 (LoopBlock)**: 任何用于生成重复元素的循环（如 Struts 的 \`<logic:iterate>\`、JSTL 的 \`<c:forEach>\`，**特别是原生 JSP 的 \`for\` 或 \`while\` 循环**）都必须转换为 \`LoopBlock\` 结构。
+    -   \`tagName\` 固定为 \`"LoopBlock"\`。
+    -   \`collection\`: 循环的数据源名称（通常是一个变量名，例如 "departments"）。
+    -   \`item\`: 每次循环中单个元素的变量名（例如 "department"）。
+    -   \`children\`: 循环体内重复生成的元素结构。
+    -   **JSP \`while\` 循环示例**:
+        **原始 JSP 代码:**
+        \`\`\`jsp
+        <html:select property="deptCode">
+          <html:option value="">[Please Select]</html:option>
+          <%
+          Iterator dep = UDepartment.getIterator();
+          while( dep.hasNext() ) {
+              UDepartment department = (UDepartment)dep.next();
+              String code = department.getCode();
+              String desc = department.getDescription();
+          %>
+            <html:option value="<%=code%>"><%=desc%></html:option>
+          <%} %>
+        </html:select>
+        \`\`\`
+
+        **必须转换成的 JSON 结构:**
+        \`\`\`json
+        {
+          "tagName": "select",
+          "attributes": { "name": "deptCode" },
+          "children": [
+            {
+              "tagName": "option",
+              "attributes": { "value": "" },
+              "isComponent": false,
+              "children": [{ "tagName": "#text", "text": "[Please Select]", "attributes": {}, "children": [], "isComponent": false }]
+            },
+            {
+              "tagName": "LoopBlock",
+              "collection": "departments",
+              "item": "department",
+              "children": [
+                {
+                  "tagName": "option",
+                  "isComponent": false,
+                  "attributes": {
+                    "value": "{department.code}"
+                  },
+                  "children": [
+                    { "tagName": "#text", "text": "{department.description}", "attributes": {}, "children": [], "isComponent": false }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+        \`\`\`
+
+4.  **样式 (style)**: 在 \`attributes\` 对象中，\`style\` 键的值 **必须是一个 CSS 键值对的 JSON 对象**，绝不能是字符串。
+5.  **文本节点**: 独立的文本内容应表示为 \`{ "tagName": "#text", "text": "你的文本内容" }\`。
+
+### 工具使用规则
+- **样式修复 (\`normalizeStyleWithLlm\`)**: 当遇到字符串形式或不规范的 \`style\` 属性时，必须优先调用此工具。
+- **片段转换 (\`convertJspSnippet\`)**: 当遇到无法直接转换的小型、独立的自定义标签（如 \`<jsp:include>\`, \`<c:if>\` 等）时，必须调用此工具。
+- **\`html:xx\` 标签**: 对于所有 \`html:xx\` 格式的标签，请将它们当作普通标签初步处理，后续的自动化规则会进行转换。
+`);
 
         sessions[sessionId].push({ role: "user", content: message });
 

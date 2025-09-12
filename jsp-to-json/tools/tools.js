@@ -97,6 +97,61 @@ ${content}
 \`\`\`
 `
     },
+    "html": {
+        systemPrompt: `你是一位精通JSP、Struts 1，并且深刻理解如何将旧版代码迁移到现代React框架的专家级前端架构师。你的任务是将Struts的 'html' 标签库转换为一个“React友好”的JSON中间表示（IR）。`,
+        userPromptTemplate: (content) => `
+**任务:** 将给定的 Struts 'html' 标签库代码片段，转换为一个旨在最终生成 React JSX 的、结构清晰的JSON对象。
+
+**核心转换理念:**
+你转换的目标不是1:1的字面翻译，而是要捕捉其“意图”，并将其映射到现代HTML5和React的最佳实践上。
+
+**通用转换规则:**
+1.  **tagName**: 将 Struts 标签转换为其最语义化的、现代小写 HTML5 标签名。
+2.  **attributes**:
+    *   迁移所有标准 HTML 属性（如 \`class\`, \`id\`, \`onclick\` 等）。
+    *   **Style属性**: 将 \`style\` 字符串 (\`"width:100px; color:red"\`) 解析为 React 的内联样式对象 (\`{"width":"100px", "color":"red"}\`)。
+    *   **Property属性 (关键)**: Struts 的 \`property\` 属性用于数据绑定。为了适配React的状态管理，它的值**必须**被映射到标准的 \`name\` 属性上。同时保留原始的 \`property\` 属性用于追溯。
+3.  **isComponent**: 对于所有由 Struts 'html' 标签转换而来的元素，此值始终为 \`false\`。
+4.  **children**: 递归处理所有子节点。
+    * 如果子节点是普通标签，按规则继续转换。
+    * 如果子节点是纯文本（例如 \`<html:link>Click</html:link>\` 里的 \`Click\`），必须转换为一个对象：
+      \`\`\`json
+      {"tagName":"#text","text":"Click","attributes":{},"children":[],"isComponent":false}
+      \`\`\`
+
+**特定标签映射规则 (React-aware):**
+*   \`<html:form action="...">\` 转换为 \`{"tagName": "form", ...}\`。
+*   \`<html:text property="user" />\` 转换为 \`{"tagName": "input", "attributes": {"type": "text", "property": "user", "name": "user"}}\`。
+*   \`<html:password property="pass" />\` 转换为 \`{"tagName": "input", "attributes": {"type": "password", "property": "pass", "name": "pass"}}\`。
+*   \`<html:textarea property="desc" />\` 转换为 \`{"tagName": "textarea", "attributes": {"property": "desc", "name": "desc"}}\`。
+*   \`<html:submit value="Login" />\` 转换为 \`{"tagName": "button", "attributes": {"type": "submit"}, "text": "Login"}\` (使用 \`<button>\` 更灵活)。
+*   \`<html:link href="/p">Go</html:link>\` 转换为 \`{"tagName": "a", "attributes": {"href": "/p"}, "text": "Go"}\`。
+*   **\`<html:errors />\` (新规则): 这是一个占位符。将其转换为一个带有特定类名的空 \`<div>\`，并在内部添加注释文本。**
+
+**输出要求:**
+- 严格按照规则输出纯粹的、可被 \`JSON.parse()\` 解析的JSON对象字符串。
+- 绝不输出任何解释、注释或Markdown代码块标记。
+
+---
+
+**示例 1: 包含数据绑定的输入框**
+输入 JSP: <html:text property="username" style="width:200px;" maxlength="50" />
+输出 JSON: {"tagName":"input","attributes":{"type":"text","property":"username","name":"username","style":{"width":"200px"},"maxlength":"50"},"children":[],"isComponent":false}
+
+**示例 2: 表单和错误占位符**
+输入 JSP: <html:form action="/login.do"><html:errors/><html:submit value="Login"/></html:form>
+输出 JSON: {"tagName":"form","attributes":{"action":"/login.do"},"children":[{"tagName":"FormErrors","attributes":{},"children":[],"isComponent":false},{"tagName":"button","attributes":{"type":"submit"},"children":[],"isComponent":false,"text":"Login"}],"isComponent":false}
+
+---
+
+**现在，请根据以上所有规则，转换以下JSP代码:**
+
+**输入 JSP 代码:**
+\`\`\`jsp
+${content}
+\`\`\`
+`
+    },
     // --- 【新增】: 支持废弃的 <font> 标签 ---
     "font": {
         systemPrompt: `你是一位专注于将过时HTML代码现代化的前端重构专家。你的任务是将废弃的 <font> 标签精确地转换为使用内联CSS样式的JSON对象表示。`,
