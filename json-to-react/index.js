@@ -107,7 +107,7 @@ async function validateJsxSyntax(code) {
     try {
         parse(code, {
             sourceType: 'module',
-            plugins: fileType === 'jsx' ? ['jsx'] : ['typescript','jsx'],
+            plugins: fileType === 'jsx' ? ['jsx'] : ['typescript', 'jsx'],
         });
     } catch (error) {
         console.error(`${fileType.toUpperCase()}语法验证失败:`, error.message);
@@ -119,22 +119,18 @@ async function validateJsxSyntax(code) {
 
 // <<< 修改：函数现在返回一个对象，包含代码和被声明的变量列表 >>>
 async function fixUndeclaredVariables(code) {
+    // 提示词现在只关注修复代码，不再要求模型提取变量名
     const repairPrompt = `你是一位React专家。你的任务是修复一段React组件代码。
 请检查以下代码，识别所有被使用但未声明的变量。
 对于每一个未声明的变量，必须在组件顶部使用 'useState' hook 进行初始化。
-关键规则：初始化时，必须同时声明变量本身及其对应的setter函数。
 例如：如果发现变量 'userName' 未声明，你应该添加 'const [userName, setUserName] = useState(undefined);'。
 不要修改任何已有的代码逻辑。
+'sessionStorage.getItem('someKey')' 会被视为合法用法，无需修复。
 
 最终你的输出必须是一个合法的JSON对象，结构如下:
 {
-  "fixedCode": "...", // 包含已添加useState声明的完整React代码字符串
-  "declaredVariables": ["...", "..."] // 一个字符串数组，仅包含你新声明的变量的名称
-}
-
-特殊情况：
-1. 'sessionStorage.getItem('someKey')' 会被视为合法用法，无需修复。
-2. 不要将 'React' 或 'useState' 本身添加到 declaredVariables 数组中。`;
+  "fixedCode": "..." // 包含已添加useState声明的完整React代码字符串
+}`;
 
     try {
         const response = await openai.chat.completions.create({
@@ -144,18 +140,32 @@ async function fixUndeclaredVariables(code) {
                 { role: "user", content: code }
             ],
             temperature: 0,
-            response_format: { type: "json_object" }, // 强制模型输出JSON格式
+            response_format: { type: "json_object" },
         });
 
         const result = JSON.parse(response.choices[0].message.content || "{}");
+        const fixedCode = result.fixedCode || code;
+
+        // 使用正则表达式从修复后的代码中可靠地提取所有useState变量
+        const declaredVariables = [];
+        // 正则表达式匹配 'const [variableName,' 或 'const [variableName]' 模式
+        const regex = /\bconst\s+\[\s*([a-zA-Z0-9_$]+)\s*[,\]]/g;
+        let match;
         
+        while ((match = regex.exec(fixedCode)) !== null) {
+            // match[1] 是捕获组，包含了我们需要的变量名
+            declaredVariables.push(match[1]);
+        }
+        
+        console.log(`从代码中提取到 ${declaredVariables.length} 个 aState 变量: [${declaredVariables.join(', ')}]`);
+
         return {
-            fixedCode: result.fixedCode || code,
-            declaredVariables: result.declaredVariables || [],
+            fixedCode: fixedCode,
+            declaredVariables: declaredVariables,
         };
 
     } catch (error) {
-        console.error("使用大模型修复变量时出错:", error);
+        console.error("使用大模型修复变量或解析状态时出错:", error);
         // 如果出错，则返回原始代码且不添加可选链
         return { fixedCode: code, declaredVariables: [] };
     }
@@ -205,7 +215,7 @@ function applySyntaxTransformations(code, variablesToMakeOptional = []) {
         const unsafeVariablesPattern = new RegExp(
             `\\b(${variablesToMakeOptional.join('|')})\\.`, 'g'
         );
-        
+
         // 将 "variable." 替换为 "variable?."
         transformedCode = transformedCode.replace(unsafeVariablesPattern, '$1?.');
         console.log(`已为变量 [${variablesToMakeOptional.join(', ')}] 的方法调用添加了可选链操作符。`);
@@ -226,7 +236,7 @@ function getRequiredToolsForMessage(message) {
     for (const tool of tools) {
         const toolName = tool.function.name;
         const triggerKeyword = toolTriggerMap[toolName];
-        
+
         if (triggerKeyword && message.includes(triggerKeyword)) {
             requiredTools.push(tool);
             console.log(`检测到关键字，为请求添加工具: ${toolName}`);
@@ -251,43 +261,46 @@ router.post('/generate-react', async (req, res) => {
         }
 
         initializeSession(sessionId, systemPrompt);
-        
+
         const currentUserContent = `请根据以下JSON生成React组件: ${message}`;
         sessions[sessionId].push({ role: "user", content: currentUserContent });
 
         const availableTools = getRequiredToolsForMessage(message);
+        let genResponseMessage; // 将此变量移到外部作用域
+        let hasToolCalls = false; // 跟踪工具是否被实际调用
 
-        const openAiOptions = {
-            model: process.env.OPENAI_MODEL || "gpt-4-turbo",
-            messages: sessions[sessionId],
-        };
+        // --- 优化点：仅在检测到可用工具时才执行此区块 ---
+        if (availableTools && availableTools.length > 0) {
+            console.log("--- 进入工具检测与执行阶段 ---");
+            const openAiOptions = {
+                model: process.env.OPENAI_MODEL || "gpt-4-turbo",
+                messages: sessions[sessionId],
+                tools: availableTools,
+                tool_choice: "auto",
+            };
 
-        if (availableTools) {
-            openAiOptions.tools = availableTools;
-            openAiOptions.tool_choice = "auto";
-        }
+            const componentGenPlannerResponse = await openai.chat.completions.create(openAiOptions);
+            genResponseMessage = componentGenPlannerResponse.choices[0].message; // 捕获响应
+            sessions[sessionId].push(genResponseMessage);
 
-        console.log("--- 进入组件生成阶段 ---");
-        const componentGenPlannerResponse = await openai.chat.completions.create(openAiOptions);
+            let toolCallsToProcess = genResponseMessage.tool_calls || [];
 
-        const genResponseMessage = componentGenPlannerResponse.choices[0].message;
-        sessions[sessionId].push(genResponseMessage);
-
-        let toolCallsToProcess = genResponseMessage.tool_calls || [];
-
-        if (toolCallsToProcess.length === 0 && genResponseMessage.content) {
-            console.log("未找到标准 tool_calls，尝试从 content 内容中规范化...");
-            const normalizedCalls = await normalizeToolCallsWithLlm(genResponseMessage.content);
-            if (normalizedCalls.length > 0) {
-                toolCallsToProcess = normalizedCalls;
-                genResponseMessage.tool_calls = normalizedCalls;
+            // 只有在可能有工具调用的情况下，才尝试规范化
+            if (toolCallsToProcess.length === 0 && genResponseMessage.content) {
+                const normalizedCalls = await normalizeToolCallsWithLlm(genResponseMessage.content);
+                if (normalizedCalls.length > 0) {
+                    toolCallsToProcess = normalizedCalls;
+                    genResponseMessage.tool_calls = normalizedCalls;
+                }
             }
-        }
 
-        const hasToolCalls = toolCallsToProcess && toolCallsToProcess.length > 0;
-        if (hasToolCalls) {
-            console.log("助手决定使用功能性工具，开始执行...");
-            await handleReactToolCalls(toolCallsToProcess, sessionId);
+            if (toolCallsToProcess && toolCallsToProcess.length > 0) {
+                console.log("助手决定使用功能性工具，开始执行...");
+                await handleReactToolCalls(toolCallsToProcess, sessionId);
+                hasToolCalls = true; // 标记工具已被调用
+            }
+        } else {
+            console.log("未检测到需要工具，直接进入代码生成阶段。");
         }
 
         // --- 统一的代码生成、验证与修复循环 (已更新) ---
@@ -302,32 +315,28 @@ router.post('/generate-react', async (req, res) => {
         while (!isCodeValid && attempts < maxAttempts) {
             attempts++;
             console.log(`--- 开始第 ${attempts}/${maxAttempts} 次代码生成与验证 ---`);
-            
+
             try {
-                if (attempts === 1 && !hasToolCalls) {
-                    generatedCode = genResponseMessage.content || "";
-                } else {
-                    const finalResponse = await openai.chat.completions.create({
-                        model: process.env.OPENAI_MODEL || "qwen3-coder",
-                        messages: sessions[sessionId],
-                        temperature: 0.1 * attempts,
-                    });
-                    generatedCode = finalResponse.choices[0].message.content || "";
-                    sessions[sessionId].push(finalResponse.choices[0].message);
-                }
+                const finalResponse = await openai.chat.completions.create({
+                    model: process.env.OPENAI_MODEL || "qwen3-coder",
+                    messages: sessions[sessionId],
+                    temperature: 0.1 * attempts,
+                });
+                generatedCode = finalResponse.choices[0].message.content || "";
+                sessions[sessionId].push(finalResponse.choices[0].message);
 
                 generatedCode = generatedCode.replace(/^```(tsx|jsx|javascript|js)?\n/i, '').replace(/\n```$/, '');
                 if (!generatedCode) throw new Error("模型生成了空代码。");
-                
+
                 // 首先，验证原始的JSX语法
                 await validateJsxSyntax(generatedCode);
-                
+
                 // <<< 修改：同时捕获修复后的代码和新声明的变量列表 >>>
                 const { fixedCode, declaredVariables } = await fixUndeclaredVariables(generatedCode);
-                
+
                 // <<< 修改：将变量列表传递给转换函数，以动态添加可选链 >>>
                 finalReactCode = applySyntaxTransformations(fixedCode, declaredVariables);
-                
+
                 isCodeValid = true;
 
             } catch (error) {

@@ -8,7 +8,8 @@ dotenv.config();
 export const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
     baseURL: process.env.OPENAI_API_BASE,
-    timeout: 1000000
+    timeout: 1000000,
+    debug: true
 });
 
 // 存储用户会话

@@ -225,6 +225,50 @@ const rulePhases = [
             }
         },
         {
+            description: "[结构] 修复 <tr> > ConditionalBlock 下的非法子元素",
+            match: (node, parent) => {
+                // 规则只对作为 <tr> 直接子元素的 ConditionalBlock 生效
+                if (node.tagName !== 'ConditionalBlock' || parent?.tagName !== 'tr') {
+                    return false;
+                }
+
+                // 检查它的任何一个分支中，是否包含需要修复的子节点
+                if (Array.isArray(node.branches)) {
+                    return node.branches.some(branch =>
+                        Array.isArray(branch.children) &&
+                        branch.children.some(child => child.tagName !== 'td' && child.tagName !== 'th')
+                    );
+                }
+                return false;
+            },
+            fix: (node) => {
+                // 遍历所有分支
+                node.branches.forEach(branch => {
+                    if (!branch.children || !Array.isArray(branch.children)) return;
+
+                    // 创建一个新的子节点数组，用于存放修复后的节点
+                    const newChildren = [];
+                    branch.children.forEach(child => {
+                        // 如果子节点本身是 td 或 th，则保持原样
+                        if (child.tagName === 'td' || child.tagName === 'th') {
+                            newChildren.push(child);
+                        } else {
+                            // 否则，创建一个新的 <td> 来包裹它
+                            const wrapperTd = {
+                                tagName: 'td',
+                                attributes: {},
+                                children: [child],
+                                isComponent: false
+                            };
+                            newChildren.push(wrapperTd);
+                        }
+                    });
+                    // 用修复后的新数组替换掉分支原来的 children 数组
+                    branch.children = newChildren;
+                });
+            }
+        },
+        {
             description: "[孤立] 修复孤立的 <td> 或 <th>",
             match: (node, parent) => {
                 if ((node.tagName === 'td' || node.tagName === 'th') && !node._wrapped) {
@@ -723,6 +767,96 @@ const rulePhases = [
 
                 node.attributes.style = style;
             }
+        },
+        // 在 rulePhases 的最后一个阶段（阶段 7）中，使用此最终修正版规则
+        {
+            description: "[通用] 标准化src和href路径，移除动态前缀 (防死循环版)",
+            match: (node) => {
+                if (!node.attributes) {
+                    return false;
+                }
+
+                // 定义一个内部辅助函数，用于判断路径是否已经符合最终规范
+                const isPathNormalized = (path) => {
+                    // 如果路径不是字符串或为空，则认为它无需处理（已规范）
+                    if (typeof path !== 'string' || !path) {
+                        return true;
+                    }
+
+                    // 规范1: 如果是完整的URL或特殊协议，则视为已规范
+                    const absoluteUrlRegex = /^(https?:\/\/|data:|mailto:|tel:|\/\/)/i;
+                    if (absoluteUrlRegex.test(path)) {
+                        return true;
+                    }
+
+                    // 规范2: 如果路径以'/'开头，并且不包含任何动态占位符前缀，则视为已规范
+                    const hasDynamicPrefix = /(^<%=[\s\S]*?%>|^\${[\s\S]*?}|^\{[^\}]+\})/.test(path);
+                    if (path.startsWith('/') && !hasDynamicPrefix) {
+                        return true;
+                    }
+
+                    // 其他所有情况都认为“未规范”，需要修复
+                    return false;
+                };
+
+                // 关键：当且仅当 src 或 href 属性存在且“未规范”时，才返回 true
+                if (node.attributes.src && !isPathNormalized(node.attributes.src)) {
+                    return true;
+                }
+                if (node.attributes.href && !isPathNormalized(node.attributes.href)) {
+                    return true;
+                }
+
+                return false;
+            },
+            fix: (node) => {
+                // fix 函数中的 normalizePath 逻辑保持不变，因为它本身是正确的
+                const normalizePath = (path) => {
+                    if (!path) return path;
+
+                    const absoluteUrlRegex = /^(https?:\/\/|data:|mailto:|tel:|\/\/)/i;
+                    if (absoluteUrlRegex.test(path)) {
+                        return path;
+                    }
+
+                    let cleanedPath = path.replace(/(^<%=[\s\S]*?%>|^\${[\s\S]*?}|^\{[^\}]+\})\/?/g, '');
+                    cleanedPath = cleanedPath.replace(/\/+/g, '/');
+
+                    if (!cleanedPath.startsWith('/')) {
+                        cleanedPath = '/' + cleanedPath;
+                    }
+                    return cleanedPath;
+                };
+
+                // 分别处理需要修复的属性
+                if (node.attributes.src) {
+                    node.attributes.src = normalizePath(node.attributes.src);
+                }
+                if (node.attributes.href) {
+                    node.attributes.href = normalizePath(node.attributes.href);
+                }
+            }
+        },
+        {
+            description: "[清理] 删除内容为空的 ConditionalBlock",
+            match: (node) => {
+                if (node.tagName !== 'ConditionalBlock' || !Array.isArray(node.branches)) {
+                    return false;
+                }
+                // 一个 ConditionalBlock 如果其所有分支都没有子节点，则被视为空。
+                return node.branches.every(branch => !branch.children || branch.children.length === 0);
+            },
+            fix: (node, parent, root) => {
+                // 确定要从哪个数组中移除此节点。
+                // 如果 `parent` 为 null，则说明这是一个位于 root.elements 中的顶级元素。
+                const container = parent ? parent.children : root.elements;
+                if (container) {
+                    const index = container.indexOf(node);
+                    if (index > -1) {
+                        container.splice(index, 1);
+                    }
+                }
+            }
         }
     ]
 ];
@@ -768,7 +902,7 @@ function addParentLinks(nodeOrArray, parent = null) {
 }
 
 /**
- * [修改后] 深度优先遍历，从给定的规则列表中查找并应用第一个匹配的规则。
+ * [修正版] 深度优先遍历，查找并应用第一个匹配的规则。
  * @param {object|array} nodeOrArray - 当前要检查的节点或节点数组。
  * @param {object} parent - 父节点。
  * @param {object} root - 整个 JSON 树的根对象。
@@ -790,6 +924,7 @@ function applyOneRule(nodeOrArray, parent, root, rulesToApply) {
 
     // Case 2: 节点是一个对象
     const node = nodeOrArray;
+
     // 首先，对当前节点尝试所有规则
     for (const rule of rulesToApply) {
         if (rule.match(node, node.parent, root)) {
@@ -799,33 +934,37 @@ function applyOneRule(nodeOrArray, parent, root, rulesToApply) {
         }
     }
 
-    // --- [修改点] 开始 ---
-    // 如果当前节点是 ConditionalBlock，则递归检查其每个分支的子节点
+    // 如果当前节点没有匹配的规则，则递归检查其子孙节点
+    
+    // --- [核心修正点] ---
+    // 特殊处理 ConditionalBlock，确保其分支本身和分支的子节点都被检查
     if (node.tagName === 'ConditionalBlock' && Array.isArray(node.branches)) {
         for (const branch of node.branches) {
-            // 注意：每个 branch 成为其 children 的父节点
+            // 步骤 1: 将 branch 对象自身视为一个节点进行规则匹配
+            // 这对于需要检查 branch 上 'condition' 属性的规则至关重要
+            for (const rule of rulesToApply) {
+                // 注意：branch 对象的父级是 ConditionalBlock 节点 (node)
+                if (rule.match(branch, node, root)) {
+                    console.log(`在 Conditional Branch 上应用规则: ${rule.description}`);
+                    rule.fix(branch, node, root);
+                    return true; // 规则已应用，立即返回 true 以重新开始收敛过程
+                }
+            }
+
+            // 步骤 2: 如果 branch 自身没有匹配，则递归检查其 children
             if (branch.children && applyOneRule(branch.children, branch, root, rulesToApply)) {
-                return true; // 分支中应用了规则，向上传递 true
+                return true; // 子节点中应用了规则，向上传递 true
             }
         }
     }
-    // --- [修改点] 结束 ---
+    // --- [修正结束] ---
 
-
-    // 如果当前节点没有匹配的规则，则递归检查其子节点 (原逻辑保持不变)
+    // 对于标准节点，递归检查其子节点
     if (node.children && Array.isArray(node.children)) {
         if (applyOneRule(node.children, node, root, rulesToApply)) {
             return true; // 子节点中应用了规则，向上传递 true
         }
     }
-
-    // 始终处理 ConditionalBlock 的 branches
-    if (node.tagName === 'ConditionalBlock' && Array.isArray(node.branches)) {
-        for (const branch of node.branches) {
-            if (applyOneRule(branch.children, branch, root, rulesToApply)) return true;
-        }
-    }
-
 
     return false; // 当前节点及其所有子节点都没有匹配任何规则
 }
@@ -868,13 +1007,13 @@ function processJsonElements(elements) {
 * [修改后] 确保 LLM 生成的内容是合法 JSON，并应用多遍分阶段修复规则直至收敛。
 */
 async function generateAndValidateJson(sessionId, initialContent) {
-        // 定义一个内部函数，用于从可能包含 Markdown 标记的字符串中提取纯 JSON 文本。
+    // 定义一个内部函数，用于从可能包含 Markdown 标记的字符串中提取纯 JSON 文本。
     const extractJsonFromString = (text) => {
         // 如果输入不是字符串（例如 null 或 undefined），返回一个空的 JSON 对象字符串以避免后续错误。
         if (typeof text !== 'string') {
             return '{}';
         }
-        
+
         // 使用正则表达式匹配 ```json ... ``` 或 ``` ... ``` 代码块。
         // [\s\S]*? 能够匹配包括换行符在内的任何字符（非贪婪模式）。
         const regex = /```(?:json)?\s*([\s\S]*?)\s*```/;
